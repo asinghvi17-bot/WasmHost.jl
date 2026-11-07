@@ -15,8 +15,9 @@ using Downloads
 f() = String(take!(Downloads.download("https://example.org/data.csv", IOBuffer())))
 ```
 
-**Status:** an early release. Tested on **Node** only, with the spool transport. Other hosts
-are designed but untested; see [Hosts](#hosts).
+**Status:** an early release. Tested end to end against native on **Node** (and Bun) and in
+**Chromium** (headless, Playwright), with both transports. Other hosts are designed but
+untested; see [Hosts](#hosts).
 
 WasmHost.jl was called WasmFetch.jl until it gained decompression and platform tags. Same UUID.
 
@@ -44,7 +45,7 @@ WasmHost.jl was called WasmFetch.jl until it gained decompression and platform t
     `WebAssembly.Suspending`, so the module is suspended while the host works. Call the export
     through `WebAssembly.promising`.
   - **`sync`:** the work runs on a worker thread while the main thread blocks in
-    `Atomics.wait`. Node only, spool transport only.
+    `Atomics.wait`. Node only, spool transport only. Browsers wait with JSPI only.
 
 ## Downloads
 
@@ -146,6 +147,8 @@ WasmHost.Platform.host_platform()   # a Base.BinaryPlatforms.Platform, as HostPl
   upstream `main` doesn't have them yet.
 - Node 22 or newer for the Node adapter (22.15 or newer for zstd), with JavaScript Promise
   Integration for the `jspi` mode (`--experimental-wasm-jspi` where it isn't on by default).
+- For the browser adapter: a browser with JSPI (Chrome or Edge 137+) and
+  [`@bjorn3/browser_wasi_shim`](https://github.com/bjorn3/browser_wasi_shim) (tested: 0.4.2).
 
 ## Building
 
@@ -205,7 +208,7 @@ protocols in `js/common/`. See [`js/README.md`](js/README.md).
 | Host | Future package | Downloads | Decompression | Platform tags | Waiting | Tested? |
 |---|---|---|---|---|---|---|
 | **Node** 22+ (`node:wasi`) | `@wasmhost/node` (`js/node/`) | spool (`spool.mjs`), import (`imports.mjs`) | spool: gzip, deflate; zstd on 22.15+ | detected arch, os, libc + overrides | JSPI; sync worker (spool) | **Yes:** spool in both modes; import only with a local WasmCodegen that has the upstream change |
-| **Browsers** | `@wasmhost/browser` (`js/browser/`, not written) | import intended; spool only on a JavaScript WASI filesystem | `DecompressionStream`: gzip, deflate, no zstd | none to detect | JSPI where available; a sync worker only with cross-origin isolation | **No.** Design notes only: not supported until something has run in a browser |
+| **Browsers** with JSPI (Chrome/Edge 137+) | `@wasmhost/browser` (`js/browser/`), on `@bjorn3/browser_wasi_shim` | spool (`spool.mjs`), import (`imports.mjs`); bodies in the shim's in-memory filesystem | spool: `DecompressionStream`: gzip, deflate; zstd where the browser has it | none to detect | JSPI only; one request in flight per module | **Yes:** spool and import in headless Chromium 158 (Playwright), against native; decompression: the adapter alone. The browser's User-Agent replaces the program's, and CORS applies: see [`js/browser/README.md`](js/browser/README.md) |
 | **workerd** | – | import fits; no filesystem | `DecompressionStream` | – | JSPI, if available | **No** (`js/workerd/`) |
 | **wasmtime** | – | CLI: no (needs a helper process and polling); import from an embedding | the embedding's | the embedding's | the embedding's | **No** (`js/wasmtime/`) |
 
@@ -232,6 +235,11 @@ Expect to update this package when either changes.
     server serves it, and deflate. The bytes must equal what native Pkg's own decompressors
     (`get_extract_cmd`: 7z, zstd) give, whose tree hash is the artifact's. Error cases, and
     the platform lines against the native run.
+
+  - `WASM_RUNTIME=chromium`: the browser adapter in Playwright's headless Chromium
+    (`test/e2e/browser/`; `npm ci` and `npx playwright install chromium` there first). spool and
+    import as above, the test resources on another origin than the page (CORS); the User-Agent
+    the server echoes must be the browser's. `decompress`: the adapter's decompression alone.
 
   ```
   julia test/e2e/e2e.jl /path/to/WasmCodegen.jl [spool|import|decompress|all]

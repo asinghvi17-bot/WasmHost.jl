@@ -1,5 +1,5 @@
-# End-to-end checks: compile a program with WasmCodegen, run it in Node with WasmHost's adapter,
-# and compare it with native.
+# End-to-end checks: compile a program with WasmCodegen, run it in Node, Bun or a headless Chromium with WasmHost's
+# adapter, and compare it with native.
 #
 #   julia test/e2e/e2e.jl /path/to/WasmCodegen.jl [spool|import|decompress|all]
 #
@@ -11,7 +11,13 @@
 #   bytes must equal what native Pkg's own decompressors give (`get_extract_cmd`: 7z, zstd),
 #   whose tree hash is the artifact's; the platform lines must equal the native run's.
 #
-# Environment: JULIA (default: this julia), WASM_RUNTIME (node, the default, or bun), NODE (default: `node` on PATH,
+# - WASM_RUNTIME=chromium: the browser adapter (js/browser/) in Playwright's headless Chromium, driven by Node
+#   (test/e2e/browser/: `npm ci` and `npx playwright install chromium` there first). spool and import as above, with
+#   the page on one origin and server.mjs on another (CORS); the browser sends its own User-Agent instead of
+#   Downloads', so the native T3 body line is compared with the browser's User-Agent in it. decompress: the browser
+#   adapter's decompression alone (browser/decompress.mjs), as dprog.jl needs WasmCodegen's julia_regex.
+#
+# Environment: JULIA (default: this julia), WASM_RUNTIME (node, the default, bun or chromium), NODE (default: `node` on PATH,
 # Node 22+ with JSPI; zstd needs 22.15+) or BUN (default: `bun` on PATH), WASMBUILDER / IRSTRUCTURIZER (paths, optional: otherwise WasmCodegen's own
 # [sources]), E2E_REUSE=1 (run modules an earlier run built, without rebuilding them),
 # E2E_ARTIFACTS (a directory with ARTIFACT.tar.gz and ARTIFACT.tar.zst, instead of downloading
@@ -26,10 +32,12 @@ const ROOT = dirname(dirname(HERE))
 wcg = abspath(ARGS[1])
 which = get(ARGS, 2, "spool")
 julia = get(ENV, "JULIA", joinpath(Sys.BINDIR, Base.julia_exename()))
-# the JavaScript runtime: WASM_RUNTIME=node (the default; NODE) or bun (BUN)
+# the JavaScript runtime: WASM_RUNTIME=node (the default; NODE), bun (BUN) or chromium (driven by NODE)
 runtime = get(ENV, "WASM_RUNTIME", "node")
-runtime in ("node", "bun") || error("WASM_RUNTIME must be node or bun, not $(repr(runtime))")
-node = get(ENV, uppercase(runtime), something(Sys.which(runtime), runtime))
+runtime in ("node", "bun", "chromium") || error("WASM_RUNTIME must be node, bun or chromium, not $(repr(runtime))")
+const BROWSER = runtime == "chromium"
+driver = BROWSER ? "node" : runtime
+node = get(ENV, uppercase(driver), something(Sys.which(driver), driver))
 work = mkpath(joinpath(HERE, "work"))
 
 # a real artifact (Bzip2_jll's binaries for aarch64-linux-gnu; any artifact works): its tree hash
@@ -83,6 +91,16 @@ function build(env, wasm, transport, program)
     run(`$julia --startup-file=no --project=$env $(joinpath(HERE, "build.jl")) $wasm $transport $program`)
 end
 
+# native's T lines, as the run must print them: in a browser, with the browser's User-Agent in the T3 body (server.mjs
+# echoes the User-Agent; a browser's fetch sends its own instead of Downloads')
+function expected(native, out)
+    want = lines(native, "T")
+    BROWSER || return want
+    m = match(r"^user agent: (.*)$"m, out)
+    m === nothing && return nothing
+    return [startswith(l, "T3 body ") ? replace(l, r"ua=.*$" => "ua=" * m[1]) : l for l in want]
+end
+
 function downloads(env, transport)
     native = read(addenv(`$node $(joinpath(HERE, "native.mjs")) $(joinpath(work, "native"))`,
                          "JULIA" => julia, "E2E_PROJECT" => env), String)
@@ -90,12 +108,14 @@ function downloads(env, transport)
     ok = !isempty(lines(native, "T"))
     wasm = joinpath(work, "fetch-$transport.wasm")
     build(env, wasm, transport, "fetch")
-    for mode in (transport == "import" ? ["import"] : ["jspi", "sync"])
-        out = output(`$node $NODE_FLAGS $(joinpath(HERE, "run.mjs")) $wasm $mode $(joinpath(work, mode))`)
+    # (a browser: the spool transport waits with JSPI only)
+    for mode in (transport == "import" ? ["import"] : BROWSER ? ["jspi"] : ["jspi", "sync"])
+        out = BROWSER ? output(`$node $(joinpath(HERE, "browser", "run.mjs")) $wasm $mode $(joinpath(work, "chromium-$mode"))`) :
+                        output(`$node $NODE_FLAGS $(joinpath(HERE, "run.mjs")) $wasm $mode $(joinpath(work, mode))`)
         skipped(out, "$transport/$mode") && continue
-        same = lines(out, "T") == lines(native, "T") && occursin("identical to the server's: true", out) &&
+        same = lines(out, "T") == expected(native, out) && occursin("identical to the server's: true", out) &&
                occursin("spool files left: 0", out)
-        println("== $transport/$mode: ", same ? "IDENTICAL to native" : "DIFFERENT", "\n", out)
+        println("== $transport/$mode: ", same ? "IDENTICAL to native" * (BROWSER ? " (the echoed User-Agent: the browser's)" : "") : "DIFFERENT", "\n", out)
         ok &= same
     end
     return ok
@@ -112,7 +132,16 @@ function artifacts()
     return dir
 end
 
+# (a browser: the adapter's decompression alone)
+function browser_decompression()
+    out = output(`$node $(joinpath(HERE, "browser", "decompress.mjs"))`)
+    ok = occursin("DECOMPRESS PASS", out)
+    println("== decompress/chromium (the adapter alone): ", ok ? "PASS" : "FAIL", "\n", out)
+    return ok
+end
+
 function decompression(env)
+    BROWSER && return browser_decompression()
     src = artifacts()
     gz, zst = joinpath(src, "$ARTIFACT.tar.gz"), joinpath(src, "$ARTIFACT.tar.zst")
     # natively: Pkg's own decompressors (7z for gzip, zstd for zstd), checked by the tree hash
@@ -152,7 +181,8 @@ function decompression(env)
     return ok
 end
 
-env = setup_env(joinpath(work, "env"))
+# (the browser's decompress part compiles nothing)
+env = BROWSER && which == "decompress" ? nothing : setup_env(joinpath(work, "env"))
 ok = true
 for part in (which == "all" ? ["spool", "import", "decompress"] : [which])
     global ok &= part == "decompress" ? decompression(env) : downloads(env, part)

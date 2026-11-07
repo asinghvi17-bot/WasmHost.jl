@@ -1,15 +1,22 @@
 {
   "name": "@wasmhost/browser",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "private": true,
-  "description": "Browser adapter of WasmHost.jl: a design, not written yet (see README.md). Not published.",
+  "description": "Browser adapter of WasmHost.jl: downloads (fetch) and decompression (DecompressionStream) for WASI modules compiled by WasmCodegen.jl, on @bjorn3/browser_wasi_shim, waiting with JSPI (Chrome 137+). Not published yet.",
   "license": "MIT",
   "type": "module",
-  "exports": {},
+  "sideEffects": false,
+  "exports": {
+    ".": "./index.mjs",
+    "./spool": "./spool.mjs",
+    "./imports": "./imports.mjs"
+  },
   "wasmhost": {
-    "transports": ["import"],
+    "transports": ["spool", "import"],
     "waiting": ["jspi"],
-    "capabilities": { "downloads": "planned", "decompress": "planned: gzip, deflate (DecompressionStream); no zstd", "platform": "none" },
-    "tested": false
+    "filesystem": "@bjorn3/browser_wasi_shim (tested: 0.4.2), in memory",
+    "capabilities": { "downloads": "spool, import", "decompress": "spool: gzip, deflate; zstd where the browser's DecompressionStream has it", "platform": "none" },
+    "tested": true,
+    "testedIn": "Chromium 158 (Playwright 1.65 headless shell), test/e2e/e2e.jl with WASM_RUNTIME=chromium"
   }
 }

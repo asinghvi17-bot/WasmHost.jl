@@ -31,15 +31,16 @@ jobs:
       - name: The adapter's modules load (${{ matrix.runtime }})
         run: |
           if [ "${{ matrix.runtime }}" = node ]; then
-            for f in js/common/*.mjs js/node/*.mjs; do node --check "$f"; done
+            for f in js/common/*.mjs js/node/*.mjs js/browser/*.mjs; do node --check "$f" || exit 1; done
           else
-            for f in js/common/*.mjs js/node/*.mjs; do bun -e "await import('$PWD/$f')" || exit 1; done
+            for f in js/common/*.mjs js/node/*.mjs js/browser/*.mjs; do bun -e "await import('$PWD/$f')" || exit 1; done
           fi
       - uses: julia-actions/julia-runtest@v1
 
   # End to end (test/e2e/e2e.jl): programs compiled by WasmCodegen (wasm-opt -O3, its default), run with the adapter
-  # in Node and in Bun, compared with the same programs run natively. The decompress part needs WasmCodegen's
-  # julia_regex host extension, which WasmCodegen no longer has: it is not run here (on any runtime).
+  # in Node, in Bun and in Playwright's headless Chromium (the browser adapter, js/browser/), compared with the same
+  # programs run natively. The decompress part needs WasmCodegen's julia_regex host extension, which WasmCodegen no
+  # longer has: it is not run here (on any runtime); in Chromium, `decompress` checks the adapter's decompression alone.
   e2e:
     name: e2e ${{ matrix.part }}, ${{ matrix.runtime }}
     runs-on: ubuntu-latest
@@ -48,7 +49,10 @@ jobs:
       fail-fast: false
       matrix:
         part: [spool, import]
-        runtime: [node, bun]
+        runtime: [node, bun, chromium]
+        include:
+          - part: decompress
+            runtime: chromium
     env:
       WASM_RUNTIME: ${{ matrix.runtime }}
       # (a run skipped for an engine gap fails the job: none is documented for Node 24 or Bun 1.4)
@@ -66,8 +70,8 @@ jobs:
       - uses: julia-actions/cache@v2
         with:
           cache-name: e2e-v1
-      # (the e2e's server, native driver and module runner all run in WASM_RUNTIME)
-      - if: matrix.runtime == 'node'
+      # (the e2e's server, native driver and module runner all run in WASM_RUNTIME; Chromium is driven by Node)
+      - if: matrix.runtime == 'node' || matrix.runtime == 'chromium'
         uses: actions/setup-node@v4
         with:
           node-version: '24'
@@ -75,5 +79,11 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: '1.4.4'
+      - if: matrix.runtime == 'chromium'
+        name: Playwright and its headless Chromium
+        working-directory: test/e2e/browser
+        run: |
+          npm ci
+          npx playwright install --with-deps --only-shell chromium
       - name: e2e ${{ matrix.part }} in ${{ matrix.runtime }}
         run: julia --startup-file=no test/e2e/e2e.jl wcg ${{ matrix.part }}
