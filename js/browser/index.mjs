@@ -6,3 +6,4 @@ export { decompressFile, hasFormat } from './decompress.mjs';
 export { makeShimFs } from './fs.mjs';
 export { makeShimJuliaIOPaths } from './julia_io_paths.mjs';
 export { jspiGap, promisingExports, ReentryError, oneAtATime, notSuspended } from './jspi.mjs';
+export { makeBridge, encodeFrame, decodeFrame } from '../common/bridge.mjs';

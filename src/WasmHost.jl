@@ -10,6 +10,8 @@ nothing changes.
   (and so `Downloads.download`) use it in the compiled module.
 - [`WasmHost.Decompress`](@ref): gzip, deflate and zstd decompression of a file by the host.
 - [`WasmHost.Platform`](@ref): the host's platform tags, passed in the WASI environment.
+- [`WasmHost.Bridge`](@ref): messages between the module and its page, in both directions (a
+  Makie scene's browser events, a session's `evaljs`).
 
 The Julia side doesn't know which host it runs on. Requests reach the host by one of two
 transports (see [`transport`](@ref)):
@@ -98,5 +100,6 @@ end
 include("downloads.jl")
 include("decompress.jl")
 include("platform.jl")
+include("bridge.jl")
 
 end # module

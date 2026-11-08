@@ -12,6 +12,10 @@
 // - opening `<spool>/<id>.hnd` (with `events`: a module with Julia tasks) starts the request of
 //   `<spool>/<id>.req` without suspending and writes its julia_io handle into it; the handle
 //   becomes ready once `<spool>/<id>.res` is written.
+// - with `bridge` (WasmHost.Bridge, js/common/bridge.mjs): opening `<spool>/<id>.snd` hands the frame of
+//   `<spool>/<id>.out` to the page; opening `<spool>/<id>.rcv` starts a receive ("wasm-bridge 1"): its content is
+//   a julia_io handle that the page's next `bridge.post` completes (or `0`: the frames are in `<id>.inb` already).
+//   Neither suspends the module, and the page's `post` is not a call into it.
 //
 //   const wasi = new WASI(args, ['WASMHOST_SPOOL=/work/.wasmhost', ...], [stdin, stdout, stderr,
 //                         new PreopenDirectory('/work', new Map())]);
@@ -46,6 +50,8 @@ const KINDS = [
   { kind: 'decompress', res: '.dres', req: '.dreq' },
   { kind: 'batch', res: '.bres', req: '.breq' },
   { kind: 'start', res: '.hnd', req: '.req' },
+  { kind: 'bsend', res: '.snd', req: '.out' },
+  { kind: 'brecv', res: '.rcv', req: '.rq' },
 ];
 
 const fetchFailure = (err) => formatResult({ code: 2, message: String(err?.message ?? err), url: '', status: 0, headers: [] });
@@ -55,7 +61,7 @@ function failure(kind, err) {
   return kind === 'decompress' ? formatDecompressAnswer(errnoOf(err), String(err?.message ?? err)) : fetchFailure(err);
 }
 
-export function wrapWasi(wasi, { spool, fetchImpl, credentials, wasiImport = wasi?.wasiImport, events } = {}) {
+export function wrapWasi(wasi, { spool, fetchImpl, credentials, wasiImport = wasi?.wasiImport, events, bridge } = {}) {
   if (!spool) throw new Error('wasmhost: no spool directory');
   const gap = jspiGap();
   if (gap) throw new Error(`wasmhost: the browser adapter needs ${gap}`);
@@ -80,7 +86,7 @@ export function wrapWasi(wasi, { spool, fetchImpl, credentials, wasiImport = was
     const guest = posix.join(dir, decoder.decode(new Uint8Array(mem.buffer, pathOff, pathLen)));
     if (posix.dirname(guest) !== spoolGuest) return null;
     const k = KINDS.find((x) => guest.endsWith(x.res));
-    if (k === undefined || (k.kind === 'start' && !jobs)) return null;
+    if (k === undefined || (k.kind === 'start' && !jobs) || ((k.kind === 'bsend' || k.kind === 'brecv') && !bridge)) return null;
     const req = guest.slice(0, -k.res.length) + k.req;
     if (fs.exists(guest) || !fs.exists(req)) return null;
     return { kind: k.kind, req, res: guest };
@@ -131,11 +137,25 @@ export function wrapWasi(wasi, { spool, fetchImpl, credentials, wasiImport = was
     fs.write(p.res, encoder.encode(String(h)));
   }
 
+  // the bridge's two files (no suspension). Never throws.
+  function bridged(p) {
+    if (p.kind === 'bsend') {
+      let ans = 'ok';
+      try { bridge.send(new Uint8Array(fs.read(p.req))); } catch (err) { ans = `error: ${String(err?.message ?? err)}`; }
+      fs.write(p.res, encoder.encode(ans));
+    } else {
+      const inb = p.req.slice(0, -'.rq'.length) + '.inb';
+      const wait = decoder.decode(fs.read(p.req)) === 'wait';
+      fs.write(p.res, encoder.encode(String(bridge.startRecv(wait, (bytes) => { fs.write(inb, bytes); }))));
+    }
+  }
+
   const path_open = new WebAssembly.Suspending((...args) => {
     const p = pending(args[0], args[2], args[3]);
     if (p === null) return original(...args);
     // (no suspension: the module goes on, the request runs)
     if (p.kind === 'start') { start(p); return original(...args); }
+    if (p.kind === 'bsend' || p.kind === 'brecv') { bridged(p); return original(...args); }
     return exclusive(() => serve(p)).then(() => original(...args));
   });
   return {

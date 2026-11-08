@@ -12,6 +12,10 @@
 //   of `<spool>/<id>.req` without waiting and writes its julia_io handle into it; the handle
 //   becomes ready once `<spool>/<id>.res` is written. Without `events` there is no such file:
 //   the module waits for each request as a program of one task does.
+// - with `bridge` (WasmHost.Bridge, js/common/bridge.mjs): opening `<spool>/<id>.snd` hands the frame of
+//   `<spool>/<id>.out` to the page; opening `<spool>/<id>.rcv` starts a receive ("wasm-bridge 1"): its content is
+//   a julia_io handle that the page's next `bridge.post` completes (or `0`: the frames are in `<id>.inb` already).
+//   Neither suspends the module.
 //
 //   const host = wrapWasi(wasi.wasiImport, { preopens, spool: '/work/.wasmhost', mode });
 //   const inst = await WebAssembly.instantiate(mod, { wasi_snapshot_preview1: host.wasiImport });
@@ -44,6 +48,8 @@ const KINDS = [
   { kind: 'decompress', res: '.dres', req: '.dreq' },
   { kind: 'batch', res: '.bres', req: '.breq' },
   { kind: 'start', res: '.hnd', req: '.req' },
+  { kind: 'bsend', res: '.snd', req: '.out' },
+  { kind: 'brecv', res: '.rcv', req: '.rq' },
 ];
 
 const fetchFailure = (err) => formatResult({ code: 2, message: String(err?.message ?? err), url: '', status: 0, headers: [] });
@@ -78,7 +84,7 @@ export async function serve(job, { fetchImpl } = {}) {
   fs.writeFileSync(job.resHost, text);
 }
 
-export function wrapWasi(wasiImport, { preopens = {}, spool, mode = 'jspi', fetchImpl, events } = {}) {
+export function wrapWasi(wasiImport, { preopens = {}, spool, mode = 'jspi', fetchImpl, events, bridge } = {}) {
   if (!spool) throw new Error('wasmhost: no spool directory');
   const map = makeMapper(preopens);
   const spoolGuest = path.posix.normalize(spool);
@@ -98,7 +104,7 @@ export function wrapWasi(wasiImport, { preopens = {}, spool, mode = 'jspi', fetc
     const guest = path.posix.join(dir, decoder.decode(new Uint8Array(memory.buffer, pathOff, pathLen)));
     if (path.posix.dirname(guest) !== spoolGuest) return null;
     const k = KINDS.find((x) => guest.endsWith(x.res));
-    if (k === undefined || (k.kind === 'start' && !jobs)) return null;
+    if (k === undefined || (k.kind === 'start' && !jobs) || ((k.kind === 'bsend' || k.kind === 'brecv') && !bridge)) return null;
     const resHost = map.toHost(guest);
     const reqHost = resHost.slice(0, -k.res.length) + k.req;
     if (fs.existsSync(resHost) || !fs.existsSync(reqHost)) return null;
@@ -138,6 +144,19 @@ export function wrapWasi(wasiImport, { preopens = {}, spool, mode = 'jspi', fetc
     fs.writeFileSync(p.resHost, String(h));
   }
 
+  // the bridge's two files (no suspension: the module goes on). Never throws.
+  function bridged(p) {
+    if (p.kind === 'bsend') {
+      let ans = 'ok';
+      try { bridge.send(new Uint8Array(fs.readFileSync(p.reqHost))); } catch (err) { ans = `error: ${String(err?.message ?? err)}`; }
+      fs.writeFileSync(p.resHost, ans);
+    } else {
+      const inbHost = p.reqHost.slice(0, -'.rq'.length) + '.inb';
+      const wait = fs.readFileSync(p.reqHost, 'utf8') === 'wait';
+      fs.writeFileSync(p.resHost, String(bridge.startRecv(wait, (bytes) => { fs.writeFileSync(inbHost, bytes); })));
+    }
+  }
+
   let path_open;
   if (mode === 'jspi') {
     if (typeof WebAssembly.Suspending !== 'function')
@@ -147,6 +166,7 @@ export function wrapWasi(wasiImport, { preopens = {}, spool, mode = 'jspi', fetc
       if (p === null) return original(...args);
       // (no suspension: the module goes on, the request runs)
       if (p.kind === 'start') { start(p); return original(...args); }
+      if (p.kind === 'bsend' || p.kind === 'brecv') { bridged(p); return original(...args); }
       return (async () => {
         let job;
         try { job = prepare(p); } catch (err) { fs.writeFileSync(p.resHost, failure(p.kind, err)); return original(...args); }
@@ -161,6 +181,7 @@ export function wrapWasi(wasiImport, { preopens = {}, spool, mode = 'jspi', fetc
     path_open = (...args) => {
       const p = pending(args[0], args[2], args[3]);
       if (p === null) return original(...args);
+      if (p.kind === 'bsend' || p.kind === 'brecv') { bridged(p); return original(...args); }
       let job;
       try { job = prepare(p); } catch (err) { fs.writeFileSync(p.resHost, failure(p.kind, err)); return original(...args); }
       worker ??= workerFor(sab);

@@ -9,6 +9,7 @@ Pkg = "44cfe95a-1eb2-52ea-b672-e2afdf69b78f"
 WasmCodegen = "5b0f1d7e-3c2a-4e8b-9a61-7d2f4c8e1a93"
 
 [extensions]
+WasmHostBridgeExt = "WasmCodegen"
 WasmHostDownloadsExt = ["Downloads", "WasmCodegen"]
 WasmHostPkgExt = ["Pkg", "WasmCodegen"]
 WasmHostPlatformExt = "WasmCodegen"
