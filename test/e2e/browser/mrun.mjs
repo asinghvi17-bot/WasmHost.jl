@@ -29,6 +29,8 @@ try {
   await page.focus('#c');
   await page.keyboard.press('a');
   await until(() => window.bridgeState().pending === 0 && window.bridgeState().stats.sent >= 7 && window.bridgeState().parked);
+  await page.evaluate(() => { window.bridgePost({ msg_type: 'pick', x: 60, y: 40 }); });   // Julia asks the page for a pick
+  await until(() => window.bridgeState().pending === 0 && window.bridgeState().stats.sent >= 9 && window.bridgeState().parked);
   const fin = await page.evaluate(() => window.finishMakie());
   for (const l of await page.evaluate(() => window.log)) console.log(l);
   console.error(`main returned ${fin.rc}; bridge ${JSON.stringify(fin.stats)}`);

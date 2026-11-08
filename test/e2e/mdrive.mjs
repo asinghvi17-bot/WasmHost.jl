@@ -14,5 +14,7 @@ export async function drive({ bridge, commId, wait, until }) {
   upd({ keyup: 'KeyA' });
   upd({ window_open: true });
   await until(() => bridge.stats.sent >= 7 && bridge.pending() === 0 && bridge.parked());
+  bridge.post({ msg_type: 'pick', x: 60, y: 40 });   // Julia asks the page what is under the cursor (below)
+  await until(() => bridge.stats.sent >= 9 && bridge.pending() === 0 && bridge.parked());
   bridge.post({ msg_type: 'stop' });
 }

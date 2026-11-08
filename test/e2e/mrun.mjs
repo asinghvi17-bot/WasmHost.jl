@@ -28,7 +28,10 @@ const until = async (f) => { for (let i = 0; i < 2000 && !f(); i++) await wait(5
 const bridge = makeBridge({ events, onMessage: (v) => {
   if (v.msg_type === '2') {   // Bonito's EvalJavascript: the source runs in the page
     const log = (...a) => console.log('JS', ...a);
-    new Function('console', 'Bonito', v.payload.source)({ log }, {});
+    // (a stand-in for WGLMakie.js's pick: the plot's uuid and the index under the cursor)
+    const WGL = { pick_closest: (scene, xy, range) => ['1234567890', 2 + xy[0] % 2] };
+    const out = new Function('console', 'Bonito', 'WGL', 'scene', v.payload.source)({ log }, {}, WGL, {});
+    if (v.bridge_ask !== undefined) Promise.resolve(out).then((value) => bridge.post({ bridge_reply: v.bridge_ask, value }));
   } else { if (v.msg_type === 'hello') commId = v.comm; console.log('R', JSON.stringify(v)); }
 } });
 const wasi = new WASI({ version: 'preview1', args: ['mprog'], env: { PWD: work, WASMHOST_SPOOL: spool }, preopens: { [work]: work }, returnOnExit: true });

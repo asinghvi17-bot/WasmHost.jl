@@ -26,7 +26,9 @@ window.startMakie = async ({ wasm }) => {
   jt = makeJuliaTask({ events, keepAlive: false, onDeadlock: () => window.log.push('DEADLOCK') });
   bridge = makeBridge({ events, onMessage: (v) => {
     if (v.msg_type === '2') {              // Bonito's EvalJavascript
-      new Function('console', 'Bonito', v.payload.source)({ log: (...a) => window.log.push('JS ' + a.join(' ')) }, {});
+      const WGL = { pick_closest: (scene, xy, range) => ['1234567890', 2 + xy[0] % 2] };   // (stands in for WGLMakie.js)
+      const out = new Function('console', 'Bonito', 'WGL', 'scene', v.payload.source)({ log: (...a) => window.log.push('JS ' + a.join(' ')) }, {}, WGL, {});
+      if (v.bridge_ask !== undefined) Promise.resolve(out).then((value) => bridge.post({ bridge_reply: v.bridge_ask, value }));
     } else {
       if (v.msg_type === 'hello') commId = v.comm;
       window.log.push('R ' + JSON.stringify(v));
@@ -54,6 +56,7 @@ window.startMakie = async ({ wasm }) => {
   return out;
 };
 
+window.bridgePost = (m) => bridge.post(m);
 window.bridgeState = () => ({ commId, parked: bridge?.parked(), stats: bridge?.stats, pending: bridge?.pending() });
 
 // window.finishMakie() -> the result of `main`, after the page tells the module to stop

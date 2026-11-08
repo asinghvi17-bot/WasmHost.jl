@@ -94,10 +94,28 @@ function dispatch(m)::Bool
         if id isa String && id == COMM.id && payload isa Dict{String, Any}
             COMM[] = payload
         end
+    elseif typ == "pick"
+        # a pick: ask the page for the plot and index under the cursor and wait (WGLMakie's pick_native/pick_closest
+        # do this with Bonito.evaljs_value). On a task of its own: the serving task has to go on receiving the answer.
+        @async pick(m)
     elseif typ == "stop"
         return false
     end
     return true
+end
+
+function pick(m::Dict{String, Any})
+    x = get(m, "x", nothing)
+    y = get(m, "y", nothing)
+    x isa Int64 || return nothing
+    y isa Int64 || return nothing
+    req = evaljs_message("return WGL.pick_closest(scene, [" * string(x) * ", " * string(y) * "], 5)")
+    r = B.ask(req)
+    out = Dict{String, Any}()
+    out["msg_type"] = "picked"
+    out["answer"] = r
+    B.send(out)
+    return nothing
 end
 
 function main()::Int32

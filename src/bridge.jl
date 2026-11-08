@@ -558,6 +558,44 @@ function recv(; wait::Bool = true)::Vector{Any}
     return out
 end
 
+## requests: a Julia task asks the page and parks until it answers (Bonito's `evaljs_value`, a pick)
+
+const PENDING = Dict{Int64,Channel{Any}}()
+const NEXT_REQUEST = Ref(Int64(0))
+
+"""
+    ask(request::Dict{String,Any}) -> Any
+
+Send `request` with a `"bridge_ask"` id and wait, as a task (parked on a `Channel`: no handle of its own), until the
+page answers with `{"bridge_reply": id, "value": ...}`, which [`serve`](@ref) (the task in `recv`) delivers. This is
+what Bonito's `evaljs_value` does with its `comm` observable, and a pick (`WGLMakie.pick_native`...) is one: the asking
+task parks on the channel while the serving task parks in `recv`'s host handle; the page's answer completes that handle,
+the serving task puts the value in the channel, the asking task wakes. Not callable from the serving task itself (its
+listener must `@async` the call, as WGLMakie's `on(comm)` does).
+"""
+function ask(request::Dict{String,Any})::Any
+    id = (NEXT_REQUEST[] += 1)
+    ch = Channel{Any}(1)
+    PENDING[id] = ch
+    request["bridge_ask"] = id
+    try
+        send(request) || throw(BridgeError("no host bridge to ask"))
+        return take!(ch)
+    finally
+        delete!(PENDING, id)
+    end
+end
+
+# an answer of the page: to the channel of its request (an unknown id, a request that gave up, is dropped)
+function deliver_reply!(m::Dict{String,Any})
+    id = get(m, "bridge_reply", nothing)
+    id isa Int64 || return nothing
+    ch = get(PENDING, id, nothing)
+    ch === nothing && return nothing
+    put!(ch, get(m, "value", nothing))
+    return nothing
+end
+
 """
     serve(f)
 
@@ -567,7 +605,11 @@ messages (`@async Bridge.serve(...)`), parked in `recv` while there are none.
 function serve(f::F) where {F}
     while true
         for m in recv()
-            f(m)::Bool || return nothing
+            if m isa Dict{String,Any} && haskey(m, "bridge_reply")
+                deliver_reply!(m)
+            else
+                f(m)::Bool || return nothing
+            end
         end
     end
 end

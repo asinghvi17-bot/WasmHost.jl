@@ -9,6 +9,7 @@ performed by the JavaScript host around the module. Natively nothing changes.
 | `WasmHost.Downloads` | HTTP requests with the host's `fetch` (TLS, redirects and proxies are the host's) | plain `Downloads.download` / `Downloads.request`, through the package extension |
 | `WasmHost.Decompress` | gzip, deflate and zstd decompression of a file by the host | `WasmHost.Decompress.decompress(src, dst)` |
 | `WasmHost.Platform` | the host's platform tags (arch, os, libc, ...) from the WASI environment | `WasmHost.Platform.host_platform()` |
+| `WasmHost.Bridge` | messages between the module and its page, both ways (a Makie scene's browser events, a session's `evaljs`, a pick's answer) | `Bridge.send(x)`, `Bridge.recv()`, `Bridge.serve(f)`, `Bridge.ask(x)` |
 
 ```julia
 using Downloads
@@ -118,6 +119,38 @@ Measured (test/e2e, 14 requests to a local server with 50 ms latency; sequential
 (at most 6 in flight: the browser's connections per host for HTTP/1.1; 66 ms for 6 requests);
 `request_all` in a program of one task 69–106 ms in Node, 165 ms in Chromium. Without the
 `julia_io` events the same `@sync`/`@async` module takes 744–763 ms.
+
+## Bridge
+
+A message channel for a program that has to talk to its page after it started (protocol `wasm-bridge 1`; design and
+evidence in [`deliverable/NOTES.md`](deliverable/NOTES.md)). Plain Julia on the module's side:
+
+```julia
+const B = WasmHost.Bridge
+B.send(Dict{String,Any}("msg_type" => "2", "payload" => payload))     # module -> page, never suspends
+t = @async B.serve(msg -> handle(msg))                                 # page -> module: parked while there are none
+answer = B.ask(request)                                                # send, and park until {"bridge_reply": id, "value": v}
+```
+
+```js
+const bridge = makeBridge({ events, onMessage: (value) => ... });      // js/common/bridge.mjs; events: the julia_io events
+const host = wrapWasi(..., { events, bridge });                        // Node or browser adapter
+bridge.post({ msg_type: '0', id: obsId, payload });                    // page -> module (from any DOM event handler)
+```
+
+- **Page to module is a handle, not a call.** The module's `recv` gets a `julia_io` external handle (like a request of the
+  concurrent downloads); `bridge.post` makes it ready, and the task that waits for it (`Runtime.Host.await_handle`)
+  runs. The page never calls into the module for an event, so the one-call-at-a-time rule of the browser adapter stays.
+  Events posted while the module is not parked wait in the bridge's queue for its next `recv`
+  (`Bridge.recv(wait = false)` / `Bridge.drain(f)` takes them without `julia_io` events, e.g. at the start of an export).
+- **Frames:** `u32le header_length | header (JSON) | blobs`; numeric vectors are typed arrays on the page
+  (`{"$b": [offset, bytes, "f32"]}`). `Bridge.encode`/`decode` are the codec, with `isa` branches on concrete types so
+  that a trimmed module resolves every call (a `Pair` or a `string` of an `Any` value is not trim-safe).
+- Needs the `WasmHostBridgeExt` extension (loaded with WasmCodegen) for the wait, and `Config(tasks = :jspi,
+  host_extensions = [:julia_io])` for a task that waits while others run.
+- Tests: `test/e2e/brprog.jl` (transport), `test/e2e/mprog.jl` (Makie: `connect_scene_events!`,
+  `on(events(scene).mousebutton)`, an evaljs-style message, a pick), built by `build_bridge.jl`/`build_makie.jl`
+  (`verify = :error`) and run by `brun.mjs`, `mrun.mjs` (Node) and `browser/mrun.mjs` (headless Chromium).
 
 ## Decompress
 

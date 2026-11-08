@@ -4,5 +4,5 @@ WARNING: Detected access to binding `Base.invokelatest_trimmed` in a world prior
   !!! This code will error in future versions of Julia.
 Hint: Add an appropriate `invokelatest` around the access to this binding.
 To make this warning an error, and hence obtain a stack trace, use `julia --depwarn=error`.
-compiled (makie, verify = error) in 342.3 s: 999575 bytes, peak RSS 1796.0 MiB, 0 diagnostics
-STRICT compile maxrss 1839572 KB, 391.11 s
+compiled (makie, verify = error) in 329.9 s: 1014221 bytes, peak RSS 1799.0 MiB, 0 diagnostics
+STRICT compile maxrss 1842352 KB, 370.29 s
