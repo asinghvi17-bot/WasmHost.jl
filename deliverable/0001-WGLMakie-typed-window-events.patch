@@ -1,0 +1,190 @@
+diff --git a/WGLMakie/src/events.jl b/WGLMakie/src/events.jl
+index 5acc967b..3d186fbb 100644
+--- a/WGLMakie/src/events.jl
++++ b/WGLMakie/src/events.jl
+@@ -52,74 +52,122 @@ function code_to_keyboard(code::String)
+     end
+ end
+ 
++# The page's payloads arrive as `Any` (a `Dict{String, Any}` decoded from MsgPack, or from a Wasm host's channel).
++# These accessors give the handler below statically typed values, so that it compiles without dynamic dispatch (a
++# trimmed or Wasm build needs that; elsewhere they are plain conversions).
++# (each one method with an `isa` chain, not several methods: a call on an `Any` value would dispatch dynamically)
++function msg_float(x)::Float64
++    x isa Float64 && return x
++    x isa Int64 && return Float64(x)
++    throw(ArgumentError("expected a number from the page, got $(typeof(x))"))
++end
++function msg_int(x)::Int
++    x isa Int64 && return x
++    x isa Float64 && return Int(x)
++    throw(ArgumentError("expected an integer from the page, got $(typeof(x))"))
++end
++function msg_string(x)::String
++    x isa String && return x
++    throw(ArgumentError("expected a string from the page, got $(typeof(x))"))
++end
++function msg_bool(x)::Bool
++    x isa Bool && return x
++    throw(ArgumentError("expected a boolean from the page, got $(typeof(x))"))
++end
++function msg_pair(x)::Tuple{Float64, Float64}
++    x isa Vector{Any} && length(x) == 2 && return (msg_float(x[1]), msg_float(x[2]))
++    throw(ArgumentError("expected 2 numbers from the page"))
++end
++function msg_string_pair(x)::Tuple{String, String}
++    x isa Vector{Any} && length(x) == 2 && return (msg_string(x[1]), msg_string(x[2]))
++    throw(ArgumentError("expected 2 strings from the page"))
++end
++
++# (a function of its own so that a build with no `@warn` with a backtrace can replace it)
++report_window_error(err) = @warn "Error in window event callback" exception = (err, Base.catch_backtrace())
++
++# (likewise: the scene's `resize!` runs Makie's compute graph, which a trimmed build may need to replace)
++resize_from_page!(scene::Scene, w::Int, h::Int) = resize!(scene, w, h)
++
++function handle_window_message!(scene::Scene, e::Events, msg::Dict{String, Any})
++    @handle msg.window_open begin
++        e.window_open[] = msg_bool(window_open)
++    end
++    @handle msg.mouseposition begin
++        x, y = msg_pair(mouseposition)
++        e.mouseposition[] = (x, y)
++    end
++    @handle msg.mousedown begin
++        mousedown = msg_int(mousedown)
++        # This can probably be done better from the JS side?
++        state = e.mousebuttonstate
++        if mousedown & 1 != 0 && !(Mouse.left in state)
++            setindex!(e.mousebutton, MouseButtonEvent(Mouse.left, Mouse.press))
++        end
++        if mousedown & 2 != 0 && !(Mouse.right in state)
++            setindex!(e.mousebutton, MouseButtonEvent(Mouse.right, Mouse.press))
++        end
++        if mousedown & 4 != 0 && !(Mouse.middle in state)
++            setindex!(e.mousebutton, MouseButtonEvent(Mouse.middle, Mouse.press))
++        end
++    end
++    @handle msg.mouseup begin
++        mouseup = msg_int(mouseup)
++        state = e.mousebuttonstate
++        if mouseup & 1 == 0 && (Mouse.left in state)
++            setindex!(e.mousebutton, MouseButtonEvent(Mouse.left, Mouse.release))
++        end
++        if mouseup & 2 == 0 && (Mouse.right in state)
++            setindex!(e.mousebutton, MouseButtonEvent(Mouse.right, Mouse.release))
++        end
++        if mouseup & 4 == 0 && (Mouse.middle in state)
++            setindex!(e.mousebutton, MouseButtonEvent(Mouse.middle, Mouse.release))
++        end
++    end
++    @handle msg.scroll begin
++        dx, dy = msg_pair(scroll)
++        e.scroll[] = (Float64(sign(dx)), Float64(sign(dy)))
++    end
++    @handle msg.keydown begin
++        code, key = msg_string_pair(keydown)
++        button = code_to_keyboard(code)
++        # don't add unknown buttons...we can't work with them
++        # and they won't get removed
++        if button != Keyboard.unknown
++            e.keyboardbutton[] = KeyEvent(button, Keyboard.press)
++        end
++        if length(key) == 1 && isascii(key)
++            e.unicode_input[] = key[1]
++        end
++    end
++    @handle msg.paste begin
++        e.paste[] = replace(msg_string(paste), "\r\n" => "\n")
++    end
++    @handle msg.keyup begin
++        keyup = msg_string(keyup)
++        if keyup == "delete_keys"
++            # this works fine
++            for key in e.keyboardstate
++                e.keyboardbutton[] = KeyEvent(key, Keyboard.release)
++            end
++        else
++            e.keyboardbutton[] = KeyEvent(code_to_keyboard(keyup), Keyboard.release)
++        end
++    end
++    @handle msg.resize begin
++        w, h = msg_pair(resize)
++        resize_from_page!(scene, round(Int, w), round(Int, h))
++    end
++    return nothing
++end
++
+ function connect_scene_events!(screen::Screen, scene::Scene, comm::Observable)
+     e = events(scene)
+     on(comm) do msg
+         @async try
+-            @handle msg.window_open begin
+-                e.window_open[] = window_open
+-            end
+-            @handle msg.mouseposition begin
+-                x, y = Float64.((mouseposition...,))
+-                e.mouseposition[] = (x, y)
+-            end
+-            @handle msg.mousedown begin
+-                # This can probably be done better from the JS side?
+-                state = e.mousebuttonstate
+-                if mousedown & 1 != 0 && !(Mouse.left in state)
+-                    setindex!(e.mousebutton, MouseButtonEvent(Mouse.left, Mouse.press))
+-                end
+-                if mousedown & 2 != 0 && !(Mouse.right in state)
+-                    setindex!(e.mousebutton, MouseButtonEvent(Mouse.right, Mouse.press))
+-                end
+-                if mousedown & 4 != 0 && !(Mouse.middle in state)
+-                    setindex!(e.mousebutton, MouseButtonEvent(Mouse.middle, Mouse.press))
+-                end
+-            end
+-            @handle msg.mouseup begin
+-                state = e.mousebuttonstate
+-                if mouseup & 1 == 0 && (Mouse.left in state)
+-                    setindex!(e.mousebutton, MouseButtonEvent(Mouse.left, Mouse.release))
+-                end
+-                if mouseup & 2 == 0 && (Mouse.right in state)
+-                    setindex!(e.mousebutton, MouseButtonEvent(Mouse.right, Mouse.release))
+-                end
+-                if mouseup & 4 == 0 && (Mouse.middle in state)
+-                    setindex!(e.mousebutton, MouseButtonEvent(Mouse.middle, Mouse.release))
+-                end
+-            end
+-            @handle msg.scroll begin
+-                e.scroll[] = Float64.((sign.(scroll)...,))
+-            end
+-            @handle msg.keydown begin
+-                button = code_to_keyboard(keydown[1])
+-                # don't add unknown buttons...we can't work with them
+-                # and they won't get removed
+-                if button != Keyboard.unknown
+-                    e.keyboardbutton[] = KeyEvent(button, Keyboard.press)
+-                end
+-                if length(keydown[2]) == 1 && isascii(keydown[2])
+-                    e.unicode_input[] = keydown[2][1]
+-                end
+-            end
+-            @handle msg.paste begin
+-                e.paste[] = replace(paste, "\r\n" => "\n")
+-            end
+-            @handle msg.keyup begin
+-                if keyup == "delete_keys"
+-                    # this works fine
+-                    for key in e.keyboardstate
+-                        e.keyboardbutton[] = KeyEvent(key, Keyboard.release)
+-                    end
+-                else
+-                    e.keyboardbutton[] = KeyEvent(code_to_keyboard(keyup), Keyboard.release)
+-                end
+-            end
+-            @handle msg.resize begin
+-                resize!(scene, tuple(resize...))
+-            end
++            handle_window_message!(scene, e, msg)
+         catch err
+-            @warn "Error in window event callback" exception = (err, Base.catch_backtrace())
++            report_window_error(err)
+         end
+         return
+     end

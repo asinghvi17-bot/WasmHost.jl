@@ -28,6 +28,9 @@ const KEYCODES = vcat(["Key" * string(c) for c in 'A':'Z'], ["Digit" * string(d)
                        "MetaLeft", "MetaRight", "Home", "End", "PageUp", "PageDown", "CapsLock", "Backquote", "Minus",
                        "Equal", "Comma", "Period", "Slash", "Semicolon", "Quote", "BracketLeft", "BracketRight",
                        "Backslash"], ["F" * string(i) for i in 1:12])
+# the page's resize runs Makie's compute graph (`resize!` of a scene), whose static path is another task's: not here
+Base.Experimental.@overlay WASM WGLMakie.resize_from_page!(scene::Scene, w::Int, h::Int) =
+    (println(Core.stderr, "resize from the page: needs the ComputePipeline static path"); nothing)
 Base.Experimental.@overlay WASM WGLMakie.code_to_keyboard(code::String) = get(KEYS, code, Makie.Keyboard.unknown)
 
 say(xs...) = (println(Core.stdout, xs...); nothing)
@@ -99,6 +102,11 @@ end
 
 function main()::Int32
     on(OnScroll(), EV.scroll)
+    # (what Bonito's registration of `comm` on the session tells the page: its id)
+    hello = Dict{String, Any}()
+    hello["msg_type"] = "hello"
+    hello["comm"] = COMM.id
+    B.send(hello)
     B.send(evaljs_message("console.log('julia ready: scene " * string(size(SCENE)[1]) * "x" * string(size(SCENE)[2]) * "')"))
     t = @async B.serve(dispatch)
     try
@@ -119,6 +127,8 @@ function prepare()
         KEYS[code] = WGLMakie.code_to_keyboard(code)
     end
     WGLMakie.connect_scene_events!(SCREEN, SCENE, COMM)
+    # the scene's own compute graph (viewport, camera inputs), typed for the closed world
+    Makie.ComputePipeline.StaticDispatch.install!(SCENE.compute)
     CW = Main.WasmCompat.Observables
     CW.register_listener!(EV.scroll, OnScroll)
     CW.register_value!(COMM, Dict{String, Any})
