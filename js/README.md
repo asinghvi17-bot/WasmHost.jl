@@ -56,7 +56,8 @@ await WebAssembly.promising(inst.exports.main)();   // mode 'sync': inst.exports
   `julia_io` events the module runs on, WasmCodegen's `makeJuliaIOEvents()`, as `events` to
   `wrapWasi` (mode `'jspi'`) or `makeImports`. A request then starts without suspending the
   module and returns an external `julia_io` handle (`events.external()`), ready when the
-  response is there: the module's task waits for it alone, its other tasks run, and their
+  response is there (`http_start(req, req_len, body, body_len)`: `body_len` -1, or absent, no
+  body; else the request's body, copied at once): the module's task waits for it alone, its other tasks run, and their
   requests overlap. Run the module's exports through WasmCodegen's julia_task (`jt.call`).
   Batches of requests (`WasmHost.Downloads.request_all`) need nothing: both transports and both
   spool modes perform a batch's requests together.

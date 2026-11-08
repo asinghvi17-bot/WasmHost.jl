@@ -102,11 +102,16 @@ t = @async Downloads.download(url, IOBuffer()); ...; body = take!(fetch(t)::IOBu
   `julia_io.mjs` has external handles (`events.external`) and with `Runtime.Tasks.enabled()`.
   `asyncmap` compiles with that WasmCodegen too (its task patches type Base's).
 - **In a program of one task** (`tasks = :none`, where `@async` can't wait):
-  `WasmHost.Downloads.request_all(urls; outputs, method, headers, timeout, throw)` hands the
-  host all the requests at once (`wasm-fetch-batch 1`: `<id>.breq`/`<id>.bres`, or
+  `WasmHost.Downloads.request_all(urls; outputs, bodies, method, headers, timeout, throw)` hands
+  the host all the requests at once (`wasm-fetch-batch 1`: `<id>.breq`/`<id>.bres`, or
   `wasm_host.http_batch`), which it performs together; one wait for all. Natively (with
   Downloads loaded, `WasmHostRequestAllExt`) it is `asyncmap` over `Downloads.request`, so the
-  program runs the same natively.
+  program runs the same natively. (In a module with tasks it is concurrent requests.)
+  `bodies[i]` (a `Vector{UInt8}`, a `String` or `nothing`) is the request body of `urls[i]`
+  (in a module with tasks and the import transport, given inline to `wasm_host.http_start`;
+  otherwise, or beyond 512 KiB, a spool file named as the request's input). `urls` may have
+  any indices (an `OffsetArray`): `outputs` and `bodies` have the same, and so do the
+  results, `similar(urls, ...)`.
 
 Measured (test/e2e, 14 requests to a local server with 50 ms latency; sequential is 700 ms):
 `@sync`/`@async` 75–98 ms in Node (all 14 in flight at once) and 163 ms in headless Chromium

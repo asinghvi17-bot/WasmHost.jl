@@ -53,6 +53,11 @@ jobs:
         include:
           - part: decompress
             runtime: chromium
+          # (Julia tasks and the host's batch, `verify = :error`: both transports, `all`'s order)
+          - part: concurrent
+            runtime: node
+          - part: batch
+            runtime: node
     env:
       WASM_RUNTIME: ${{ matrix.runtime }}
       # (a run skipped for an engine gap fails the job: none is documented for Node 24 or Bun 1.4)
@@ -61,8 +66,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
         with:
-          repository: gbaraldi/WasmCodegen.jl
-          ref: 0034569817c5ddf1b7d1836df38f1b3d6bb00460
+          # (feat/task-park-host-wait: Julia tasks on julia_io, asyncmap typed on Julia 1.12 and 1.13)
+          repository: asinghvi17-bot/WasmCodegen.jl
+          ref: 467d91ed800eedf56b249847b8032274a8fc8643
           path: wcg
       - uses: julia-actions/setup-julia@v2
         with:
@@ -96,4 +102,9 @@ jobs:
           npm ci
           npx playwright install --with-deps --only-shell chromium
       - name: e2e ${{ matrix.part }} in ${{ matrix.runtime }}
-        run: julia --startup-file=no test/e2e/e2e.jl wcg ${{ matrix.part }}
+        run: |
+          if [ "${{ matrix.part }}" = concurrent ] || [ "${{ matrix.part }}" = batch ]; then
+            for t in spool import; do julia --startup-file=no test/e2e/e2e.jl wcg ${{ matrix.part }} $t || exit 1; done
+          else
+            julia --startup-file=no test/e2e/e2e.jl wcg ${{ matrix.part }}
+          fi

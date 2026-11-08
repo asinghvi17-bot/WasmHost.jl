@@ -6,14 +6,15 @@ import { pipeline } from 'node:stream/promises';
 import { curlCode } from '../common/fetch.mjs';
 import { requestSignal } from '../common/jobs.mjs';
 
-// Perform one request (`req` of parseRequest, with `outputHost`/`inputHost` mapped): the result
-// for formatResult. `signal` aborts it (the module gave up a request it started).
+// Perform one request (`req` of parseRequest, with `outputHost`/`inputHost` mapped, or with
+// `body`, bytes, instead of an input): the result for formatResult. `signal` aborts it (the module gave up a request it started).
 export async function perform(req, { fetchImpl = globalThis.fetch, signal } = {}) {
   try {
     const init = { method: req.method, headers: req.headers, redirect: 'follow' };
     const sig = requestSignal(req.timeout, signal);
     if (sig) init.signal = sig;
-    if (req.inputHost) { init.body = fs.readFileSync(req.inputHost); }
+    if (req.body) init.body = req.body;
+    else if (req.inputHost) init.body = fs.readFileSync(req.inputHost);
     const r = await fetchImpl(req.url, init);
     if (req.outputHost && r.body) {
       await pipeline(Readable.fromWeb(r.body), fs.createWriteStream(req.outputHost));

@@ -77,8 +77,9 @@ await exports.main();
   freely. The browser opens at most 6 connections per host for HTTP/1.1, so more requests to
   one host than that overlap in rounds.
 - `makeShimJuliaIOPaths(wasi)`: `julia_io`'s `path_mode`, `path_chmod`, `path_symlink` on the
-  shim (no permission bits, no links: a file is 0o100644, a directory 0o040755), which a module
-  built with `host_extensions = [:julia_io]` imports; WasmCodegen's own are Node's.
+  shim (no permission bits, no links: a file is 0o100644, a directory 0o040755; chmod and
+  symlink answer ENOSYS, julia_io's "no modes", so a mode asked of mkdir or open is not an
+  error), which a module built with `host_extensions = [:julia_io]` imports; WasmCodegen's own are Node's.
 - `makeShimFs(wasi)` is the adapter's view of the shim's preopens (read and write a file by
   guest path), for a page that puts inputs in or takes results out.
 

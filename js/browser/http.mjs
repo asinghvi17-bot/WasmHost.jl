@@ -13,8 +13,8 @@ export function curlCode(err) {
   return CURLE.RECV_ERROR;
 }
 
-// Perform one request (`req` of parseRequest; `input` and `output` are guest paths of `fs`):
-// the result for formatResult.
+// Perform one request (`req` of parseRequest; `input` and `output` are guest paths of `fs`; or
+// `body`, bytes, instead of an input): the result for formatResult.
 //
 // The browser sets some request headers itself and drops the program's: `User-Agent` in
 // Chromium (Downloads' default one too), `Accept-Encoding`, `Cookie`, `Host` and the rest of
@@ -29,7 +29,8 @@ export async function perform(req, fs, { fetchImpl = globalThis.fetch.bind(globa
     const init = { method: req.method, headers: req.headers, redirect: 'follow', credentials };
     const sig = requestSignal(req.timeout, signal);
     if (sig) init.signal = sig;
-    if (req.input) init.body = fs.read(req.input).slice();
+    if (req.body) init.body = req.body;
+    else if (req.input) init.body = fs.read(req.input).slice();
     const r = await fetchImpl(req.url, init);
     if (req.output) fs.write(req.output, new Uint8Array(await r.arrayBuffer()));
     else await r.body?.cancel();

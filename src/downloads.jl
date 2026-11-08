@@ -26,8 +26,8 @@ How the program waits for the host:
 
 - As a Julia task (`tasks = :jspi`): the host starts the request and returns at once with a
   handle of WasmCodegen's `julia_io` events (opening `<spool>/<id>.hnd`, whose content is the
-  handle, after writing `<id>.req`; or `wasm_host.http_start`), which it makes ready when the
-  response is there (`<id>.res`; or `wasm_host.http_finish`). The task waits for the handle as
+  handle, after writing `<id>.req`; or `wasm_host.http_start`, which takes the request's body
+  too), which it makes ready when the response is there (`<id>.res`; or `wasm_host.http_finish`). The task waits for the handle as
   for a timer (`Runtime.Host.await_handle`): the scheduler runs the other tasks meanwhile, and
   the module suspends only when every task waits, until one of their handles is ready. A host
   that can't start requests (no `julia_io` events given to the adapter) answers as before.
@@ -49,7 +49,13 @@ struct Result
     headers::Vector{Pair{String,String}}
 end
 
-"A request: the arguments of [`request`](@ref)."
+"""
+    Request(url, method, headers, input, output, timeout, body = nothing)
+
+A request: the arguments of [`request`](@ref). `body` (a `Vector{UInt8}`, a `String` or
+`nothing`) is the request's body given as bytes, instead of an `input` path (an
+`ArgumentError` when there are both); it is kept as a copy.
+"""
 struct Request
     url::String
     method::String
@@ -57,7 +63,20 @@ struct Request
     input::String
     output::String
     timeout::Float64
+    body::Union{Nothing,Vector{UInt8}}
+    function Request(url, method, headers, input, output, timeout, body = nothing)
+        b = body_bytes(body)
+        b === nothing || isempty(input) ||
+            throw(ArgumentError(string(PROTOCOL, ": a request with both a body and an input path")))
+        return new(url, method, headers, input, output, timeout, b)
+    end
 end
+
+"A request body as bytes (a copy), or `nothing`."
+body_bytes(::Nothing) = nothing
+body_bytes(s::AbstractString) = Vector{UInt8}(codeunits(String(s)))
+# (`copyto!`: by position, whatever the body's indices)
+body_bytes(b::AbstractVector{UInt8}) = copyto!(Vector{UInt8}(undef, length(b)), b)
 
 field(s::String, what::String) = WasmHost.field(s, PROTOCOL, what)
 
@@ -85,30 +104,49 @@ function request_text(url::String, method::String, headers::Vector{Pair{String,S
     return String(take!(io))
 end
 
-request_text(r::Request) = request_text(r.url, r.method, r.headers, r.input, r.output, r.timeout)
+request_text(r::Request) = request_text(r, r.input)
+request_text(r::Request, input::String) = request_text(r.url, r.method, r.headers, input, r.output, r.timeout)
 
-"""
-    request(url, method, headers, input, output, timeout) -> Result
-
-Perform the request through the host. `input`/`output` are paths of the program's filesystem
-(\"\": none). Never throws for a failure of the request itself: that is `Result.code != 0`
-(code 2 when the host has no fetch). In a module with Julia Tasks, only the calling task waits
-(see the module's documentation).
-"""
-function request(url::String, method::String, headers::Vector{Pair{String,String}},
-                 input::String, output::String, timeout::Float64)::Result
-    isempty(spool_dir()) && return no_spool(url)
-    text = request_text(url, method, headers, input, output, timeout)
-    if concurrent()
-        s = start(text)
-        s === nothing || return parse_result(split_lines(finish!(s)), url)
-    end
-    res = exchange(text)
-    res === nothing && return no_response(url)
-    return parse_result(split_lines(res), url)
+# the request's input path: its own, or (a body) `path`, a spool file the body is written to
+function input_of(r::Request, path::String)::String
+    r.body === nothing && return r.input
+    write(path, r.body)
+    return path
 end
 
-request(r::Request) = request(r.url, r.method, r.headers, r.input, r.output, r.timeout)
+"""
+    request(url, method, headers, input, output, timeout; body = nothing) -> Result
+    request(r::Request) -> Result
+
+Perform the request through the host. `input`/`output` are paths of the program's filesystem
+(\"\": none); `body` (a `Vector{UInt8}` or a `String`) is the request's body instead of an
+`input`. Never throws for a failure of the request itself: that is `Result.code != 0` (code 2
+when the host has no fetch). In a module with Julia Tasks, only the calling task waits (see
+the module's documentation).
+"""
+request(url::String, method::String, headers::Vector{Pair{String,String}},
+        input::String, output::String, timeout::Float64; body = nothing)::Result =
+    request(Request(url, method, headers, input, output, timeout, body))
+
+function request(r::Request)::Result
+    isempty(spool_dir()) && return no_spool(r.url)
+    if concurrent()
+        s = start(r)
+        s === nothing || return parse_result(split_lines(finish!(s)), r.url)
+    end
+    return exchange_result(r)
+end
+
+"The [`Result`](@ref) of the request, waiting for it (the module suspends); a body from a spool file."
+function exchange_result(r::Request)::Result
+    path = r.body === nothing ? "" : spool_path(".in")
+    try
+        res = exchange(request_text(r, input_of(r, path)))
+        return res === nothing ? no_response(r.url) : parse_result(split_lines(res), r.url)
+    finally
+        isempty(path) || rm(path; force = true)
+    end
+end
 
 "The response text of a request, waiting for it (the module suspends); `nothing` if no host answered."
 exchange(text::String)::Union{Nothing,String} =
@@ -146,12 +184,20 @@ has neither performs them one after the other. Never throws for a failure of a r
 """
 function request_batch(reqs::Vector{Request})::Vector{Result}
     isempty(spool_dir()) && return Result[no_spool(r.url) for r in reqs]
-    texts = String[request_text(r) for r in reqs]
-    concurrent() && return request_started(reqs, texts)
-    res = WasmHost.transport() === :import ? batch_import_lines(texts) : spool_batch(texts)
-    # (a host without batches: one after the other)
-    res === nothing && return Result[request(r) for r in reqs]
-    return Result[parse_result(res[i], reqs[i].url) for i in eachindex(reqs)]
+    concurrent() && return request_started(reqs)
+    # (bodies from spool files)
+    inputs = String[r.body === nothing ? "" : spool_path(".in") for r in reqs]
+    try
+        texts = String[request_text(reqs[i], input_of(reqs[i], inputs[i])) for i in eachindex(reqs)]
+        res = WasmHost.transport() === :import ? batch_import_lines(texts) : spool_batch(texts)
+        # (a host without batches: one after the other)
+        res === nothing && return Result[exchange_result(r) for r in reqs]
+        return Result[parse_result(res[i], reqs[i].url) for i in eachindex(reqs)]
+    finally
+        for p in inputs
+            isempty(p) || rm(p; force = true)
+        end
+    end
 end
 
 "The text of a batch of request texts (see the module's documentation)."
@@ -207,40 +253,57 @@ compilation. Natively, and in a program of one task, `false`.
 """
 concurrent() = false
 
-"A request the host has started: its `julia_io` handle, and its spool files' path without suffix (the spool transport)."
+"""
+A request the host has started: its `julia_io` handle, its spool files' path without suffix
+(the spool transport; else `""`), and the spool file of its body (`""`: none).
+"""
 struct Started
     handle::Int32
     base::String
+    input::String
 end
 
 """
-    start(text) -> Union{Nothing,Started}
+    start(r::Request) -> Union{Nothing,Started}
 
 Have the host start the request, without waiting; `nothing` if it can't (then
-[`exchange`](@ref) it). Release it with [`finish!`](@ref) (or [`abandon!`](@ref)).
+[`exchange_result`](@ref)). Release it with [`finish!`](@ref) (or [`abandon!`](@ref)).
 """
-start(text::String)::Union{Nothing,Started} =
-    WasmHost.transport() === :import ? import_start(text) : spool_start(text)
+start(r::Request)::Union{Nothing,Started} =
+    WasmHost.transport() === :import ? import_start(r) : spool_start(r)
 
-function import_start(text::String)::Union{Nothing,Started}
-    h = start_import(text)
-    return h > 0 ? Started(h, "") : nothing
+"The largest body `wasm_host.http_start` takes in the linear memory; a larger one goes through a spool file."
+const INLINE_BODY_MAX = 1 << 19
+
+function import_start(r::Request)::Union{Nothing,Started}
+    b = r.body
+    if b === nothing || length(b) <= INLINE_BODY_MAX
+        h = start_import(request_text(r), b)
+        return h > 0 ? Started(h, "", "") : nothing
+    end
+    path = spool_path(".in")
+    h = start_import(request_text(r, input_of(r, path)), nothing)
+    h > 0 && return Started(h, "", path)
+    rm(path; force = true)
+    return nothing
 end
 
-# `<id>.req`, then `<id>.hnd`, whose opening starts the request and holds its handle; an
-# adapter without `julia_io` events doesn't answer it (there is no such file)
-function spool_start(text::String)::Union{Nothing,Started}
+# `<id>.req` (and the body, `<id>.in`), then `<id>.hnd`, whose opening starts the request and
+# holds its handle; an adapter without `julia_io` events doesn't answer it (there is no such file)
+function spool_start(r::Request)::Union{Nothing,Started}
     base = spool_path("")
-    write(base * ".req", text)
+    input = input_of(r, base * ".in")
+    write(base * ".req", request_text(r, input))
     h = nothing
     try
         h = tryparse(Int32, strip(read(base * ".hnd", String)))
     catch
         h = nothing
     end
-    (h === nothing || h <= 0) || return Started(h, base)
+    (h === nothing || h <= 0) || return Started(h, base, r.body === nothing ? "" : input)
     rm(base * ".req"; force = true)
     rm(base * ".hnd"; force = true)
+    r.body === nothing || rm(input; force = true)
     return nothing
 end
 
@@ -272,6 +335,7 @@ end
 "Release the started request `s` (its handle and its spool files); the host drops it if it still runs."
 function abandon!(s::Started)
     close_handle(s.handle)
+    isempty(s.input) || rm(s.input; force = true)
     if WasmHost.transport() !== :import
         rm(s.base * ".req"; force = true)
         rm(s.base * ".hnd"; force = true)
@@ -282,15 +346,14 @@ end
 
 # all started first, then each waited for in turn (those the host couldn't start, exchanged);
 # what remains started when one throws, released
-function request_started(reqs::Vector{Request}, texts::Vector{String})::Vector{Result}
-    started = Union{Nothing,Started}[start(t) for t in texts]
+function request_started(reqs::Vector{Request})::Vector{Result}
+    started = Union{Nothing,Started}[start(r) for r in reqs]
     out = Vector{Result}(undef, length(reqs))
     try
         for i in eachindex(reqs)
             s = started[i]
             if s === nothing
-                res = exchange(texts[i])
-                out[i] = res === nothing ? no_response(reqs[i].url) : parse_result(split_lines(res), reqs[i].url)
+                out[i] = exchange_result(reqs[i])
             else
                 started[i] = nothing
                 out[i] = parse_result(split_lines(finish!(s)), reqs[i].url)
@@ -305,7 +368,10 @@ function request_started(reqs::Vector{Request}, texts::Vector{String})::Vector{R
 end
 
 # (the extension's methods: WasmCodegen's runtime and the `wasm_host` imports)
-"`wasm_host.http_start`: the handle of the started request, or ≤ 0 when the host can't start one."
+"""
+`wasm_host.http_start`: `start_import(text, body)`, the handle of the started request (its
+body, bytes or `nothing`, given inline), or ≤ 0 when the host can't start one.
+"""
 function start_import end
 "`wasm_host.http_finish`: the response text of a started request that is ready; `nothing` if there is none."
 function finish_import end
@@ -317,12 +383,15 @@ function close_handle end
 ## for programs
 
 """
-    request_all(urls; outputs = nothing, method = nothing, headers = [], timeout = Inf,
-                throw = true) -> Vector{Union{Downloads.Response,Downloads.RequestError}}
+    request_all(urls; outputs = nothing, bodies = nothing, method = nothing, headers = [],
+                timeout = Inf, throw = true) -> AbstractVector{Union{Downloads.Response,Downloads.RequestError}}
 
 `Downloads.request` of each URL, all at once: `outputs[i]` (a path, an `IO` or `nothing`) is
-the output of `urls[i]`; the other arguments are each request's. The results are in the order
-of `urls`; with `throw`, the first failure (a `RequestError`) is thrown once all are done.
+the output of `urls[i]`, `bodies[i]` (a `Vector{UInt8}`, a `String` or `nothing`) its request
+body (with a body and no `method`, a PUT, as `Downloads.request` with an `input`); the other
+arguments are each request's. `urls` is any `AbstractVector` (of any indices: an `OffsetArray`
+too); `outputs` and `bodies` have its indices, and so do the results (`similar(urls, ...)`).
+With `throw`, the first failure (a `RequestError`) is thrown once all are done.
 
 Natively it is `asyncmap` over `Downloads.request` (with Downloads loaded). In a module
 compiled by WasmCodegen (`WasmHostDownloadsExt`) it is [`request_batch`](@ref): in a program of
@@ -330,5 +399,14 @@ one task (`tasks = :none`, where `@async` can't wait), the host performs them al
 request; with tasks, as concurrent `Downloads.request`s.
 """
 function request_all end
+
+# (request_all's arguments: `outputs` and `bodies` indexed as `urls`)
+function check_indices(urls::AbstractVector, x, what::String)
+    x === nothing && return nothing
+    a, b = axes(x, 1), axes(urls, 1)
+    a == b || throw(ArgumentError(string("request_all: the ", what, " have the indices ", first(a), ":", last(a),
+                                         ", the urls ", first(b), ":", last(b))))
+    return nothing
+end
 
 end # module Downloads

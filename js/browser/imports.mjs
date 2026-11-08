@@ -20,7 +20,8 @@
 //     (promisingExports). A request while another of the module is in flight (the page called
 //     the module directly, again) throws a ReentryError into the module.
 //   wasm_host.http_start, http_finish (a module with Julia tasks: `events`), http_batch and
-//     http_batch_result: as the Node adapter's (../node/imports.mjs). A start while the module
+//     http_batch_result: as the Node adapter's (../node/imports.mjs), http_start's optional
+//     body too. A start while the module
 //     is suspended (a re-entry) throws a ReentryError into the module.
 // `fetchImpl` replaces `fetch`; `credentials` is fetch's (default 'omit'). `events`: the
 // julia_io events (WasmCodegen's js/julia_io.mjs) of a module with tasks, whose exports are
@@ -53,10 +54,11 @@ export function makeImports({ wasi, spool, fetchImpl, credentials, events } = {}
   }
   const text = (off, len) => new TextDecoder().decode(new Uint8Array(mem().buffer, off, len));
   // the response text of a request text (never throws)
-  async function respond(reqText, signal) {
+  async function respond(reqText, signal, body) {
     let result;
     try {
       const req = parseRequest(reqText);
+      if (body) req.body = body;
       stats.requests++;
       result = await perform(req, fs, { fetchImpl, credentials, signal });
     } catch (err) {
@@ -76,12 +78,14 @@ export function makeImports({ wasi, spool, fetchImpl, credentials, events } = {}
     const reqText = text(reqOff, reqLen);
     return put(encoder.encode(await respond(reqText)), resOff, resCap);
   }
-  function http_start(reqOff, reqLen) {
+  function http_start(reqOff, reqLen, bodyOff, bodyLen) {
     check();
     if (!jobs) return -ENOSYS;
     const reqText = text(reqOff, reqLen);
+    // (a copy of the body: `bodyLen` < 0 or absent, none)
+    const body = typeof bodyLen === 'number' && bodyLen >= 0 ? new Uint8Array(mem().buffer, bodyOff >>> 0, bodyLen).slice() : undefined;
     stats.started++;
-    return jobs.start((signal) => respond(reqText, signal), (t) => encoder.encode(t));
+    return jobs.start((signal) => respond(reqText, signal, body), (t) => encoder.encode(t));
   }
   const http_finish = (h, resOff, resCap) => { check(); return put(jobs?.result(h), resOff, resCap); };
   async function http_batch(reqOff, reqLen) {

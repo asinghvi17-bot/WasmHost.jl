@@ -2,7 +2,7 @@
 # in Bun (WASM_RUNTIME).
 # The end-to-end checks, which compile programs with WasmCodegen and run them in Node, are in
 # test/e2e/e2e.jl.
-using Test, WasmHost
+using Test, WasmHost, Downloads
 using WasmHost: split_lines, spool_dir
 using WasmHost.Downloads: request_text, parse_result, Result, Request, batch_text, parse_batch, request_batch
 using WasmHost.Decompress: DecompressError, decompress, parse_answer
@@ -15,6 +15,28 @@ const runtime = get(ENV, "WASM_RUNTIME", "node")
 runtime in ("node", "bun") || error("WASM_RUNTIME must be node or bun, not $(repr(runtime))")
 const node = something(get(ENV, uppercase(runtime), nothing), Sys.which(runtime), Some(nothing))
 const NOSPOOL = ("WASMHOST_SPOOL" => nothing, "WASM_FETCH_SPOOL" => nothing)
+
+# A vector indexed from 0 (OffsetArrays' kind, without the dependency), for request_all
+struct ZeroVec{T} <: AbstractVector{T}
+    v::Vector{T}
+end
+Base.size(z::ZeroVec) = size(z.v)
+Base.axes(z::ZeroVec) = (Base.IdentityUnitRange(0:length(z.v)-1),)
+Base.getindex(z::ZeroVec, i::Int) = z.v[i+1]
+Base.setindex!(z::ZeroVec, x, i::Int) = (z.v[i+1] = x)
+Base.similar(z::ZeroVec, ::Type{T}, ax::Tuple{Base.IdentityUnitRange{UnitRange{Int}}}) where {T} =
+    ZeroVec(Vector{T}(undef, length(ax[1])))
+
+# test/e2e/server.mjs on a free port, for `f(base)`; nothing without a JavaScript runtime
+function with_server(f)
+    p = open(`$node $(joinpath(@__DIR__, "e2e", "server.mjs")) 0`; read = true)
+    try
+        m = match(r"listening (\d+)", readline(p))
+        return f("http://127.0.0.1:" * m[1])
+    finally
+        kill(p)
+    end
+end
 
 @testset "WasmHost" begin
     @testset "spool directory" begin
@@ -69,6 +91,81 @@ const NOSPOOL = ("WASMHOST_SPOOL" => nothing, "WASM_FETCH_SPOOL" => nothing)
             @test r.code == 2 && occursin("no response", r.message)
         end
         @test isempty(readdir(dir))
+    end
+
+    @testset "Downloads: request bodies" begin
+        r = Request("http://h/a", "POST", Pair{String,String}[], "", "", Inf, "héllo")
+        @test r.body == codeunits("héllo") && r.input == ""
+        b = UInt8[1, 2, 3]
+        r = Request("http://h/a", "POST", Pair{String,String}[], "", "", Inf, b)
+        @test r.body == b && r.body !== b   # (a copy)
+        # (any indices: by position)
+        @test Request("u", "PUT", Pair{String,String}[], "", "", Inf, ZeroVec(UInt8[7, 8])).body == [7, 8]
+        @test Request("u", "GET", Pair{String,String}[], "/w/in", "", Inf).body === nothing
+        @test Request("u", "POST", Pair{String,String}[], "", "", Inf, UInt8[]).body == UInt8[]
+        @test_throws ArgumentError Request("u", "POST", Pair{String,String}[], "/w/in", "", Inf, "x")
+        # (the request text has no body; the body goes inline to http_start, or as a spool file named as the input)
+        @test request_text(Request("u", "POST", Pair{String,String}[], "", "", Inf, "x")) == request_text("u", "POST", Pair{String,String}[], "", "", Inf)
+        # without a host: no response, and the body's spool file not left behind
+        dir = mktempdir()
+        withenv("WASMHOST_SPOOL" => dir) do
+            r = WasmHost.Downloads.request("http://h/x", "POST", Pair{String,String}[], "", "", Inf; body = "payload")
+            @test r.code == 2 && occursin("no response", r.message)
+            rs = request_batch([Request("http://h/a", "POST", Pair{String,String}[], "", "", Inf, "a"),
+                                Request("http://h/b", "GET", Pair{String,String}[], "", "", Inf)])
+            @test all(r -> r.code == 2, rs)
+        end
+        @test isempty(readdir(dir))
+    end
+
+    # natively (WasmHostRequestAllExt: asyncmap over Downloads.request) against test/e2e/server.mjs: urls of any
+    # indices, the results indexed as them; POST bodies
+    @testset "Downloads: request_all natively" begin
+        if node === nothing
+            @test_skip "$runtime not found"
+        else
+            with_server() do base
+                urls = ZeroVec([base * "/echo-body", base * "/echo-body", base * "/hello.txt"])
+                ios = ZeroVec([IOBuffer() for _ in 1:3])
+                bodies = ZeroVec(Union{Nothing,String,Vector{UInt8}}["one body", UInt8[0x62, 0x79, 0x74, 0x65, 0x73], nothing])
+                rs = WasmHost.Downloads.request_all(urls; outputs = ios, bodies, method = "POST")
+                @test rs isa ZeroVec && axes(rs) == axes(urls)
+                @test [r.status for r in rs.v] == [201, 201, 200]
+                @test String(take!(ios[0])) == "POST 8 one body
+"
+                @test String(take!(ios[1])) == "POST 5 bytes
+"
+                @test occursin("Hello", String(take!(ios[2])))
+                # a body and no method: a PUT, as Downloads.request with an input
+                io = IOBuffer()
+                rs = WasmHost.Downloads.request_all([base * "/echo-body"]; outputs = [io], bodies = ["x"])
+                @test rs isa Vector && rs[1].status == 201 && String(take!(io)) == "PUT 1 x
+"
+                # without bodies, as before
+                rs = WasmHost.Downloads.request_all([base * "/hello.txt", base * "/nothing"]; throw = false)
+                @test [r.status for r in rs] == [200, 404]
+                # concurrent bodies, a large one among them, after earlier ones (on a shared Downloader, natively, that
+                # request never ends)
+                big = repeat("abcdefgh", 75_000)
+                batches = (["first", "second body"], ["first", "second body", big], [big, "x", big])
+                t = @async map(batches) do bs
+                    ios = [IOBuffer() for _ in bs]
+                    WasmHost.Downloads.request_all(fill(base * "/echo-body", length(bs)); outputs = ios, bodies = bs, method = "POST")
+                    [length(take!(io)) for io in ios]
+                end
+                for _ in 1:300
+                    istaskdone(t) && break
+                    sleep(0.1)
+                end
+                @test istaskdone(t) && !istaskfailed(t)
+                # ("POST <n> <body>\n")
+                istaskdone(t) && @test collect(fetch(t)) == [[sizeof(b) + 7 + ndigits(sizeof(b)) for b in bs] for bs in batches]
+                # outputs or bodies indexed otherwise than the urls
+                @test_throws ArgumentError WasmHost.Downloads.request_all(urls; outputs = [IOBuffer() for _ in 1:3])
+                @test_throws ArgumentError WasmHost.Downloads.request_all(urls.v; bodies = ZeroVec(["a", "b", "c"]))
+                @test_throws ArgumentError WasmHost.Downloads.request_all(urls.v; bodies = ["a"])
+            end
+        end
     end
 
     @testset "Downloads: batches" begin
@@ -242,7 +339,8 @@ const NOSPOOL = ("WASMHOST_SPOOL" => nothing, "WASM_FETCH_SPOOL" => nothing)
             // the imports, on a memory, with a fetch that answers after a while
             const mem = new WebAssembly.Memory({ initial: 1 });
             const seen = [];
-            const fetchImpl = async (url) => { seen.push(url); await new Promise((r) => setTimeout(r, 20)); return new Response('x', { status: 203 }); };
+            const bodies = {};
+            const fetchImpl = async (url, init) => { seen.push(url); bodies[url] = init?.body; await new Promise((r) => setTimeout(r, 20)); return new Response('x', { status: 203 }); };
             const ev2 = fake();
             const host = makeImports({ events: ev2, fetchImpl });
             host.bindMemory(mem);
@@ -261,13 +359,40 @@ const NOSPOOL = ("WASMHOST_SPOOL" => nothing, "WASM_FETCH_SPOOL" => nothing)
             out.push(['http_finish once ready: the response', ev2.hs.get(hb).ready && n > 0 && get(1024, n).split('\\n')[4] === '203']);
             out.push(['http_finish into a small buffer: -length', host.imports.wasm_host.http_finish(ha, 1024, 4) === -n]);
             out.push(['without events: -ENOSYS', makeImports({}).imports.wasm_host.http_start(0, 0) === -52]);
+            // a body, inline: copied at once (the module may reuse its buffer); -1: none; an empty one
+            const hc = host.imports.wasm_host.http_start(0, put(req('http://h/c'), 0), 2048, put('payload', 2048));
+            put('XXXXXXX', 2048);
+            const hd = host.imports.wasm_host.http_start(0, put(req('http://h/d'), 0), 2048, -1);
+            const he = host.imports.wasm_host.http_start(0, put(req('http://h/e'), 0), 2048, 0);
+            await new Promise((r) => setTimeout(r, 60));
+            out.push(['http_start with a body: sent, a copy', hc > 0 && new TextDecoder().decode(bodies['http://h/c']) === 'payload']);
+            out.push(['http_start with body_len -1 or none: no body, an empty one: empty', bodies['http://h/d'] === undefined && bodies['http://h/a'] === undefined && bodies['http://h/e']?.length === 0]);
             process.stdout.write(out.map(([w, ...ok]) => w + ': ' + ok.every(Boolean)).join('\\n'));
             """
             res = split(read(`$node --input-type=module -e $script`, String), '\n')
-            @test length(res) == 9
+            @test length(res) == 11
             for l in res
                 @test endswith(l, ": true")
             end
+        end
+    end
+
+    # the browser adapter's julia_io paths on the shim: status returns (path_chmod, path_symlink) are positive errnos,
+    # ENOSYS (WasmCodegen's "a host without modes"), path_mode's a negated one
+    @testset "JavaScript: browser julia_io paths" begin
+        if node === nothing
+            @test_skip "$runtime not found"
+        else
+            script = """
+            import { makeShimJuliaIOPaths } from $(js("browser", "julia_io_paths.mjs"));
+            const paths = makeShimJuliaIOPaths({ fds: [] });
+            const mem = new WebAssembly.Memory({ initial: 1 });
+            paths.bindMemory(mem);
+            const b = new TextEncoder().encode('relative'); new Uint8Array(mem.buffer, 0, b.length).set(b);
+            const { path_chmod, path_symlink, path_mode } = paths.imports;
+            process.stdout.write([path_chmod(0, b.length, 0o700), path_symlink(0, 1, 0, b.length), path_mode(0, b.length, 1)].join(' '));
+            """
+            @test read(`$node --input-type=module -e $script`, String) == "52 52 -28"
         end
     end
 

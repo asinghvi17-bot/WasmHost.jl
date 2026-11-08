@@ -2,7 +2,7 @@
 # fetched later), nothing Wasm-specific. Compiled with `Config(tasks = :jspi)`, the requests overlap. Lines "C..." are
 # compared with native; lines "time ..." are the wall times of the parts, in ms.
 module ConcurrentProg
-using Downloads
+using Downloads, WasmHost
 
 say(xs...) = (println(Core.stdout, xs...); nothing)
 base() = get(ENV, "FETCH_BASE", "http://127.0.0.1:8765")
@@ -67,6 +67,18 @@ function main()::Int32
         else
             say("C4 other error")
         end
+    end
+    # 5. request bodies, as tasks (WasmHost.Downloads.request_all): small ones (the import transport: inline in
+    # http_start) and one beyond what http_start takes inline (a spool file). (Names of their own: a variable of
+    # main that an @async above captures and that is assigned again is boxed, not trim-safe.)
+    echo = base() * "/echo-body"
+    bodies = ["first", "second body", repeat("abcdefgh", 75_000)]
+    bios = [IOBuffer() for _ in 1:3]
+    brs = WasmHost.Downloads.request_all([echo, echo, echo]; outputs = bios, bodies, method = "POST")
+    for i in 1:3
+        r = brs[i]
+        b = take!(bios[i])
+        say("C5 ", i, " ", r isa Downloads.Response ? r.status : -1, " ", length(b), " ", fnv(b))
     end
     return Int32(0)
 end

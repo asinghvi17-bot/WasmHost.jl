@@ -2,15 +2,19 @@
 // `path_symlink`; its js/julia_io.mjs `makeJuliaIOPaths` is Node's) on the in-memory filesystem of
 // @bjorn3/browser_wasi_shim, for a module built with `host_extensions = [:julia_io]` (as one with Julia tasks is)
 // that runs in a browser. The shim has no permission bits and no symbolic links: a file is 0o100644, a directory
-// 0o040755; chmod and symlink are ENOTSUP. The module's other `julia_io` imports are WasmCodegen's events
-// (`makeJuliaIOEvents`, which run in browsers).
+// 0o040755. chmod and symlink return ENOSYS: julia_io's errno of a host without modes (WasmCodegen's
+// `FS.NO_MODES`), positive as every status return of julia_io is (only `path_mode`'s is negated). The module then
+// does what it does without them: an explicit chmod fails with ENOTSUP, the mode asked of a mkdir or open is the
+// host's (not an error), and symlink falls back to WASI's `path_symlink`. (Another errno would be the operation's
+// error: a `mkdir(dir; mode = 0o700)`, as `mktempdir` makes, would fail.) The module's other `julia_io` imports
+// are WasmCodegen's events (`makeJuliaIOEvents`, which run in browsers).
 //
 //   const paths = makeShimJuliaIOPaths(wasi);
 //   ... { julia_io: { ...paths.imports, ...events.imports } } ...
 //   paths.bindMemory(inst.exports.memory);
 import { makeShimFs } from './fs.mjs';
 
-const ENOENT = 44, EINVAL = 28, ENOTSUP = 58, EIO = 29;
+const ENOENT = 44, EINVAL = 28, ENOSYS = 52, EIO = 29;
 
 export function makeShimJuliaIOPaths(wasi) {
   const fs = makeShimFs(wasi);
@@ -30,7 +34,8 @@ export function makeShimJuliaIOPaths(wasi) {
       return err?.code === 'EACCES' ? -76 : -EIO;   // (outside the preopens: ENOTCAPABLE)
     }
   }
-  const unsupported = (what) => () => { lastError = `${what}: the browser's filesystem has none`; return ENOTSUP; };
+  // (a status: a positive errno)
+  const unsupported = (what) => () => { lastError = `${what}: the browser's filesystem has none`; return ENOSYS; };
   return {
     imports: { path_mode, path_chmod: unsupported('path_chmod'), path_symlink: unsupported('path_symlink') },
     bindMemory(m) { memory = m; },

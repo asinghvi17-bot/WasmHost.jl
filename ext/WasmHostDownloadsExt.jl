@@ -65,14 +65,24 @@ function kept_text(get::F, cap::Int)::Union{Int32,String} where {F}
     end
 end
 
-# `wasm_host.http_start(req, req_len) -> handle` (≤ 0: the host can't start requests), not
-# suspending; `wasm_host.http_finish(h, res, res_cap) -> len`, the response once `h` is ready
-function Host.start_import(text::String)::Int32
+# `wasm_host.http_start(req, req_len, body, body_len) -> handle` (≤ 0: the host can't start
+# requests), not suspending; `body_len` -1: no body. (An adapter that predates the body takes the
+# first two arguments: a JavaScript function ignores the others.) `wasm_host.http_finish(h, res,
+# res_cap) -> len`, the response once `h` is ready
+function Host.start_import(text::String, body::Union{Nothing,Vector{UInt8}})::Int32
     return Staging.with_scope() do
         n = sizeof(text)
         req = Staging.alloc_data(n; align = 1)
         Staging.copy_to_linear!(req, text, 1, n)
-        ccall((:http_start, "wasm_host"), Int32, (UInt32, UInt32), req, UInt32(n))
+        boff, blen = UInt32(0), Int32(-1)
+        if body !== nothing
+            blen = Int32(length(body))
+            if blen > 0
+                boff = Staging.alloc_data(blen; align = 1)
+                Staging.copy_to_linear!(boff, body, 1, Int(blen))
+            end
+        end
+        ccall((:http_start, "wasm_host"), Int32, (UInt32, UInt32, UInt32, Int32), req, UInt32(n), boff, blen)
     end
 end
 
@@ -233,38 +243,43 @@ end
 Base.Experimental.@overlay WasmCodegen.Runtime.WASM_METHODS function Host.request_all(
     urls     :: AbstractVector{<:AbstractString};
     outputs  :: Union{AbstractVector, Nothing} = nothing,
+    bodies   :: Union{AbstractVector, Nothing} = nothing,
     method   :: Union{AbstractString, Nothing} = nothing,
     headers  :: Union{AbstractVector, AbstractDict} = Pair{String,String}[],
     timeout  :: Real = Inf,
     throw    :: Bool = true,
-) :: Vector{Union{Response, RequestError}}
-    outputs === nothing || length(outputs) == length(urls) ||
-        Base.throw(ArgumentError("request_all: $(length(outputs)) outputs for $(length(urls)) urls"))
-    return wasm_request_all(urls, outputs, method, headers, Float64(timeout), throw)
+)
+    Host.check_indices(urls, outputs, "outputs")
+    Host.check_indices(urls, bodies, "bodies")
+    return wasm_request_all(urls, outputs, bodies, method, headers, Float64(timeout), throw)
 end
 
-function wasm_request_all(urls, outputs, method, headers, timeout::Float64,
-                          throw::Bool)::Vector{Union{Response,RequestError}}
+# (the requests in the order of `eachindex(urls)`, the k-th of `urls[idx[k]]`; the results
+# indexed as `urls`)
+function wasm_request_all(urls, outputs, bodies, method, headers, timeout::Float64, throw::Bool)
     hdrs = request_headers(headers)
+    idx = collect(eachindex(urls))
     reqs = Host.Request[]
     outs = String[]
-    for i in eachindex(urls)
+    for i in idx
         o = outputs === nothing ? nothing : outputs[i]
+        b = bodies === nothing ? nothing : bodies[i]
         out = output_path(o)
         push!(outs, out)
-        push!(reqs, Host.Request(String(urls[i]), request_method(method, nothing, o), hdrs, "", out, timeout))
+        push!(reqs, Host.Request(String(urls[i]), request_method(method, b, o), hdrs, "", out, timeout, b))
     end
-    res = Vector{Union{Response,RequestError}}(undef, length(reqs))
+    res = similar(urls, Union{Response,RequestError})
     try
         rs = Host.request_batch(reqs)
-        for i in eachindex(reqs)
+        for k in eachindex(idx)
+            i = idx[k]
             o = outputs === nothing ? nothing : outputs[i]
-            rs[i].code == 0 && copy_body!(o, outs[i])
-            res[i] = response_of(reqs[i].url, rs[i])
+            rs[k].code == 0 && copy_body!(o, outs[k])
+            res[i] = response_of(reqs[k].url, rs[k])
         end
     finally
-        for i in eachindex(reqs)
-            outputs !== nothing && outputs[i] isa IO && rm(outs[i]; force = true)
+        for k in eachindex(idx)
+            outputs !== nothing && outputs[idx[k]] isa IO && rm(outs[k]; force = true)
         end
     end
     if throw

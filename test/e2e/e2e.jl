@@ -74,7 +74,9 @@ function setup_env(dir)
     return dir
 end
 
-lines(s, prefix) = filter(l -> startswith(l, prefix), split(s, '\n'))
+# the lines of `s` of a program's prefix: a one-letter prefix followed by a digit ("C1 ..."; not a banner line of the
+# julia that ran it, "Commercial use ..."), or a longer one ("file ")
+lines(s, prefix) = filter(l -> startswith(l, prefix) && (length(prefix) > 1 || (length(l) > 1 && isdigit(l[2]))), split(s, '\n'))
 
 # a run the runner skipped (an engine gap it names: `SKIP: …`), reported as such; with E2E_ALLOW_SKIP=0, a failure
 function skipped(out, what)

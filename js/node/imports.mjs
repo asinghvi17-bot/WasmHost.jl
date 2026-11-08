@@ -24,10 +24,12 @@
 //     req: the request text of "wasm-fetch 1" (src/downloads.jl), res: the response text
 //     written back; returns its length (or -length when res_cap is too small: nothing
 //     written). Suspending (JSPI): the export must be called through WebAssembly.promising.
-//   wasm_host.http_start(req_off i32, req_len i32) -> i32
+//   wasm_host.http_start(req_off i32, req_len i32, body_off i32, body_len i32) -> i32
 //     Starts the request and returns at once: a julia_io handle (> 0) that becomes ready when
 //     the response is there, or -52 (ENOSYS) without `events`. Not suspending. The module
 //     closes the handle (julia_io's `close`), which drops the request if it still runs.
+//     `body_len` ≥ 0: the request's body, the bytes at body_off (instead of the request's
+//     input path); -1, or absent (a module that predates the body): none.
 //   wasm_host.http_finish(h i32, res_off i32, res_cap i32) -> i32
 //     The response text of the started request `h` once it is ready: its length, -length when
 //     res_cap is too small (nothing written; kept), 0 when there is none (not ready, unknown).
@@ -52,11 +54,14 @@ export function makeImports({ preopens = {}, fetchImpl, events } = {}) {
   let lastBatch = [];
 
   const text = (off, len) => new TextDecoder().decode(new Uint8Array(memory.buffer, off, len));
+  // a copy of the body http_start gives (`len` < 0 or absent: none)
+  const bodyBytes = (off, len) => typeof len === 'number' && len >= 0 ? new Uint8Array(memory.buffer, off >>> 0, len).slice() : undefined;
   // the response text of a request text (never throws)
-  async function respond(reqText, signal) {
+  async function respond(reqText, signal, body) {
     let result;
     try {
       const req = parseRequest(reqText);
+      if (body) req.body = body;
       req.outputHost = req.output ? map.toHost(req.output) : '';
       req.inputHost = req.input ? map.toHost(req.input) : '';
       stats.requests++;
@@ -77,11 +82,12 @@ export function makeImports({ preopens = {}, fetchImpl, events } = {}) {
   async function http_request(reqOff, reqLen, resOff, resCap) {
     return put(encoder.encode(await respond(text(reqOff, reqLen))), resOff, resCap);
   }
-  function http_start(reqOff, reqLen) {
+  function http_start(reqOff, reqLen, bodyOff, bodyLen) {
     if (!jobs) return -ENOSYS;
     const reqText = text(reqOff, reqLen);
+    const body = bodyBytes(bodyOff, bodyLen);
     stats.started++;
-    return jobs.start((signal) => respond(reqText, signal), (t) => encoder.encode(t));
+    return jobs.start((signal) => respond(reqText, signal, body), (t) => encoder.encode(t));
   }
   const http_finish = (h, resOff, resCap) => put(jobs?.result(h), resOff, resCap);
   async function http_batch(reqOff, reqLen) {
