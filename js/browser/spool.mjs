@@ -14,13 +14,17 @@
 //   const inst = await WebAssembly.instantiate(mod, { wasi_snapshot_preview1: host.wasiImport });
 //   host.bindMemory(inst.exports.memory);
 //   wasi.initialize(inst);
-//   await WebAssembly.promising(inst.exports.main)();
+//   const exports = promisingExports(inst);           // (jspi.mjs: one call at a time)
+//   await exports.main();
 //
 // Waiting is JSPI only: `path_open` is a `WebAssembly.Suspending`, and exports that download or
-// decompress must be called through `WebAssembly.promising`. (A page's main thread can't block,
-// so Node's 'sync' mode has no browser counterpart.) One job at a time per module: don't call
-// the module's exports again while one is suspended.
-// `fetchImpl` replaces `fetch`; `wasiImport` replaces `wasi.wasiImport` (e.g. a wrapped one).
+// decompress must be called through `WebAssembly.promising`: call them all through
+// `promisingExports(inst)`, which also keeps to one call at a time per module (Julia's runtime
+// isn't re-entrant). (A page's main thread can't block, so Node's 'sync' mode has no browser
+// counterpart.) A job that starts while another of the module is suspended (the page called the
+// module directly, again) throws a ReentryError into the module.
+// `fetchImpl` replaces `fetch`; `credentials` is fetch's (default 'omit': the page's cookies
+// aren't the program's); `wasiImport` replaces `wasi.wasiImport` (e.g. a wrapped one).
 import { parseRequest, formatResult } from '../common/fetch.mjs';
 import { parseDecompressRequest, formatDecompressAnswer } from '../common/decompress.mjs';
 import { makeShimFs, posix } from './fs.mjs';
@@ -40,7 +44,7 @@ function failure(kind, err) {
     : formatDecompressAnswer(errnoOf(err), String(err?.message ?? err));
 }
 
-export function wrapWasi(wasi, { spool, fetchImpl, wasiImport = wasi?.wasiImport } = {}) {
+export function wrapWasi(wasi, { spool, fetchImpl, credentials, wasiImport = wasi?.wasiImport } = {}) {
   if (!spool) throw new Error('wasmhost: no spool directory');
   const gap = jspiGap();
   if (gap) throw new Error(`wasmhost: the browser adapter needs ${gap}`);
@@ -68,7 +72,8 @@ export function wrapWasi(wasi, { spool, fetchImpl, wasiImport = wasi?.wasiImport
     if (fs.exists(guest) || !fs.exists(req)) return null;
     return { kind: k.kind, req, res: guest };
   }
-  // do the job of a pending response and write the response file; never throws
+  // do the job of a pending response and write the response file; throws only a ReentryError
+  // (exclusive's) or when the response can't be written
   async function serve(p) {
     let text;
     try {
@@ -76,11 +81,11 @@ export function wrapWasi(wasi, { spool, fetchImpl, wasiImport = wasi?.wasiImport
       if (p.kind === 'fetch') {
         const req = parseRequest(body);
         stats.requests++;
-        text = formatResult(await exclusive(() => perform(req, fs, { fetchImpl })));
+        text = formatResult(await perform(req, fs, { fetchImpl, credentials }));
       } else {
         const d = parseDecompressRequest(body);
         stats.decompress++;
-        const [errno, message] = await exclusive(() => decompressFile(fs, d.src, d.dst, d.format));
+        const [errno, message] = await decompressFile(fs, d.src, d.dst, d.format);
         text = formatDecompressAnswer(errno, message);
       }
     } catch (err) {
@@ -92,7 +97,7 @@ export function wrapWasi(wasi, { spool, fetchImpl, wasiImport = wasi?.wasiImport
   const path_open = new WebAssembly.Suspending((...args) => {
     const p = pending(args[0], args[2], args[3]);
     if (p === null) return original(...args);
-    return serve(p).then(() => original(...args));
+    return exclusive(() => serve(p)).then(() => original(...args));
   });
   return {
     wasiImport: { ...wasiImport, path_open },

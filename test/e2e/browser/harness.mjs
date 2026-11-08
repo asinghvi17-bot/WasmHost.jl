@@ -3,9 +3,10 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', '..', '..');
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const MIME = { '.html': 'text/html; charset=utf-8', '.mjs': 'text/javascript', '.js': 'text/javascript', '.wasm': 'application/wasm' };
 
 // Serve the repository's files (and `wasm`, if given, as /module.wasm) on 127.0.0.1: { server, origin }

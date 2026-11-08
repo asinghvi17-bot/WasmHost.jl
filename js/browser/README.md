@@ -14,7 +14,7 @@ shim's version (tested: 0.4.2).
 
 ```js
 import { WASI, File, OpenFile, PreopenDirectory, ConsoleStdout } from '@bjorn3/browser_wasi_shim';
-import { wrapWasi, makeImports, jspiGap } from './WasmHost.jl/js/browser/index.mjs';
+import { wrapWasi, makeImports, promisingExports, jspiGap } from './WasmHost.jl/js/browser/index.mjs';
 
 if (jspiGap()) throw new Error(jspiGap());                  // no JSPI: e.g. Firefox, Safari
 const root = new PreopenDirectory('/work', new Map());      // the module's filesystem, in memory
@@ -29,20 +29,30 @@ const inst = await WebAssembly.instantiate(mod, { wasi_snapshot_preview1: host.w
 //   const inst = await WebAssembly.instantiate(mod, { wasi_snapshot_preview1: wasi.wasiImport, ...host.imports });
 host.bindMemory(inst.exports.memory);
 wasi.initialize(inst);
-await WebAssembly.promising(inst.exports.main)();
+const exports = promisingExports(inst);                     // every call into the module goes through these
+await exports.main();
 ```
 
-- `wrapWasi(wasi, { spool, fetchImpl, wasiImport })`: wraps the shim's `path_open`, as
+- `promisingExports(instance, { whenBusy })`: the instance's function exports, each through
+  `WebAssembly.promising` (so each returns a promise), one call at a time: a call made while
+  another is in flight waits for it to settle (`whenBusy: 'queue'`, the default) or is rejected
+  with a `ReentryError` (`'reject'`). Call the module only through these (see
+  [one call at a time](#requirements-and-limits)).
+- `wrapWasi(wasi, { spool, fetchImpl, credentials, wasiImport })`: wraps the shim's `path_open`, as
   `../node/spool.mjs` does Node's: opening `<spool>/<id>.res` performs `<spool>/<id>.req`,
   opening `<spool>/<id>.dres` decompresses as `<spool>/<id>.dreq` asks. `wasiImport` replaces
   `wasi.wasiImport` (e.g. one wrapped already).
-- `makeImports({ wasi, spool, fetchImpl })`: `{ wasm_host: { http_request } }`. The spool
+- `makeImports({ wasi, spool, fetchImpl, credentials })`: `{ imports: { wasm_host: { http_request } }, bindMemory, stats }`. The spool
   directory is still needed: request bodies from, and responses into, an `IO` go through files
   in it. Decompression always uses the spool transport: give such a module `wrapWasi`'s
   `wasiImport` too.
 - The shim's import map entry, or a bundler, resolves `@bjorn3/browser_wasi_shim` for the page;
   the adapter itself imports only `../common/` by relative path (see `js/README.md` on
   publishing).
+- `credentials` is `fetch`'s, `'omit'` by default: the page's cookies and HTTP authentication
+  don't go with the program's requests, as natively libcurl has neither. Pass `'same-origin'` or
+  `'include'` to send them (a cross-origin server must then name the origin and allow
+  credentials).
 - `makeShimFs(wasi)` is the adapter's view of the shim's preopens (read and write a file by
   guest path), for a page that puts inputs in or takes results out.
 
@@ -50,23 +60,31 @@ await WebAssembly.promising(inst.exports.main)();
 
 - **JSPI:** Chrome and Edge 137+, where it is on by default. Not in Firefox or Safari at the
   time of writing: `wrapWasi` and `makeImports` throw, and `jspiGap()` says why. Exports that
-  download or decompress are called through `WebAssembly.promising`. There is no `sync` mode: a
+  download or decompress are called through `WebAssembly.promising` (`promisingExports`). There
+  is no `sync` mode: a
   page's main thread can't block. (A Worker could, with `SharedArrayBuffer` under cross-origin
   isolation and a second worker for `fetch`; not written.)
-- **One request in flight per module:** the module is suspended while the host works, and
-  Julia's runtime isn't re-entrant. Don't call the module's exports again until the promise of
-  the suspended one settles: a second job of the same instance while one is in flight fails
-  (code 2, or `EIO` for decompression) with the message
-  `another request of this module is in flight`.
-- **User-Agent:** a browser sends its own. Chromium ignores the program's `User-Agent`,
-  Downloads' default one included; Firefox would send it. Servers that require a particular
-  User-Agent (e.g. tile servers' usage policies) see the browser's.
+- **One call at a time per module:** the module is suspended in the middle of an export while
+  the host works, and the page's event loop runs on, but Julia's runtime isn't re-entrant: no
+  call may enter the module, on any export, until the suspended export's promise settles. Call
+  the module only through `promisingExports(instance)`, which keeps to this (queueing or
+  rejecting). A page that calls `instance.exports` directly in the meantime runs Julia code
+  re-entrantly, which nothing can make safe; the adapter catches it at the latest when that call
+  needs the host (a download or a decompression while another is in flight): it throws a
+  `ReentryError` into the module, which unwinds the re-entrant call (WasmCodegen's handlers
+  catch only Julia's own exceptions) and rejects its promise.
+- **User-Agent:** the browser's, not the program's. The Fetch standard no longer forbids
+  setting `User-Agent`, but Chromium drops it silently from `fetch` requests
+  ([crbug 571722](https://crbug.com/571722)), Downloads' default one included; the e2e checks
+  that Chromium sends its own. Servers that require a particular User-Agent (e.g. tile servers'
+  usage policies) see the browser's.
 - **CORS:** the module's requests are the page's. A cross-origin server must allow the page's
   origin (`Access-Control-Allow-Origin`). Request headers other than CORS-safelisted ones (any
   custom header, such as `X-Probe` or an `Authorization`) need a preflight that the server
   answers with `Access-Control-Allow-Headers`. The module sees only the CORS-safelisted response
   headers and those the server lists in `Access-Control-Expose-Headers`. A CORS refusal looks
-  like a network failure to the page: libcurl's code 7.
+  like a network failure to the page: libcurl's code 7. Requests carry no credentials unless
+  `credentials` says so.
 - **Other request headers:** the browser drops the Fetch standard's forbidden ones
   (`Accept-Encoding`, `Cookie`, `Host`, `Content-Length`, ...) and decodes compressed responses
   itself. `set-cookie` is never visible.
@@ -91,7 +109,11 @@ WASM_RUNTIME=chromium julia test/e2e/e2e.jl /path/to/WasmCodegen.jl all
   Chromium (`browser/run.mjs`). The page and the module come from one local origin; the test
   resources (`server.mjs`) from another, with CORS. The output and the downloaded 3 MiB file
   must equal the native program's, byte for byte, except the User-Agent the server echoes back
-  (T3), which must be the browser's.
+  (T3), which must be the browser's. Then `main` is called twice at once through
+  `promisingExports`: queued, both runs must equal native's, one after the other; with
+  `whenBusy: 'reject'`, the second must be a `ReentryError` and the first equal native's. The
+  adapter's host guard is checked on its own too (a second job of an instance is a
+  `ReentryError` until the first settles; other instances are not blocked).
 - **decompress:** `browser/decompress.mjs`, the adapter alone in Chromium: gzip, deflate and
   zstd made by `node:zlib` must decompress to the original bytes (or zstd `ENOSYS`), and the
   error cases must give WasmHost.Decompress's errnos. (`test/e2e/dprog.jl` needs WasmCodegen's

@@ -15,7 +15,8 @@
 #   (test/e2e/browser/: `npm ci` and `npx playwright install chromium` there first). spool and import as above, with
 #   the page on one origin and server.mjs on another (CORS); the browser sends its own User-Agent instead of
 #   Downloads', so the native T3 body line is compared with the browser's User-Agent in it. decompress: the browser
-#   adapter's decompression alone (browser/decompress.mjs), as dprog.jl needs WasmCodegen's julia_regex.
+#   adapter's decompression alone (browser/decompress.mjs), as dprog.jl needs WasmCodegen's julia_regex. spool and
+#   import also call main twice at once through promisingExports (queued; rejected), and check the host guard.
 #
 # Environment: JULIA (default: this julia), WASM_RUNTIME (node, the default, bun or chromium), NODE (default: `node` on PATH,
 # Node 22+ with JSPI; zstd needs 22.15+) or BUN (default: `bun` on PATH), WASMBUILDER / IRSTRUCTURIZER (paths, optional: otherwise WasmCodegen's own
@@ -117,6 +118,31 @@ function downloads(env, transport)
                occursin("spool files left: 0", out)
         println("== $transport/$mode: ", same ? "IDENTICAL to native" * (BROWSER ? " (the echoed User-Agent: the browser's)" : "") : "DIFFERENT", "\n", out)
         ok &= same
+        BROWSER && (ok &= twice(wasm, mode, native))
+    end
+    return ok
+end
+
+# (a browser) main called twice at once through promisingExports: queued, the second runs after the first, and the
+# output is native's twice, in order; rejected, the second fails with a ReentryError and the first is native's. With
+# reject, the adapter's own guard of host jobs too.
+function twice(wasm, mode, native)
+    ok = true
+    for how in ("queue", "reject")
+        out = output(`$node $(joinpath(HERE, "browser", "run.mjs")) $wasm $mode $(joinpath(work, "chromium-$mode-$how")) $how`)
+        want = expected(native, out)
+        good = want !== nothing && occursin("main returned 0 ", out) && occursin("spool files left: 0", out) &&
+               occursin("identical to the server's: true", out)
+        if how == "queue"
+            good &= lines(out, "T") == vcat(want, want) && occursin("second call: 0\n", out)
+        else
+            guard = lines(out, "host guard: ")
+            good &= lines(out, "T") == want && occursin(r"^second call: rejected: ReentryError: "m, out) &&
+                    length(guard) == 4 && all(endswith(": true"), guard)
+        end
+        println("== $mode, main twice at once ($how): ", good ? (how == "queue" ? "both IDENTICAL to native, one after the other" :
+                                                                "the second REJECTED, the first IDENTICAL to native") : "WRONG", "\n", out)
+        ok &= good
     end
     return ok
 end

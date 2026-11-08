@@ -18,9 +18,13 @@ export function curlCode(err) {
 // The browser sets some request headers itself and drops the program's: `User-Agent` in
 // Chromium (Downloads' default one too), `Accept-Encoding`, `Cookie`, `Host` and the rest of
 // the Fetch standard's forbidden request headers.
-export async function perform(req, fs, { fetchImpl = globalThis.fetch.bind(globalThis) } = {}) {
+//
+// `credentials` is fetch's: 'omit' by default, so that the page's cookies and HTTP
+// authentication don't go with the program's requests (libcurl, natively, has neither);
+// 'same-origin' or 'include' to send them.
+export async function perform(req, fs, { fetchImpl = globalThis.fetch.bind(globalThis), credentials = 'omit' } = {}) {
   try {
-    const init = { method: req.method, headers: req.headers, redirect: 'follow' };
+    const init = { method: req.method, headers: req.headers, redirect: 'follow', credentials };
     if (Number.isFinite(req.timeout)) init.signal = AbortSignal.timeout(Math.max(1, req.timeout * 1000));
     if (req.input) init.body = fs.read(req.input).slice();
     const r = await fetchImpl(req.url, init);

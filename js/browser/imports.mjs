@@ -6,7 +6,7 @@
 //   const inst = await WebAssembly.instantiate(mod, { wasi_snapshot_preview1: wasi.wasiImport, ...host.imports });
 //   host.bindMemory(inst.exports.memory);
 //   wasi.initialize(inst);
-//   await WebAssembly.promising(inst.exports.main)();
+//   await promisingExports(inst).main();               // (jspi.mjs: one call at a time)
 //
 // (Request bodies from and responses into an `IO` still go through files of the spool
 // directory, `WASMHOST_SPOOL`, on the shim's filesystem: `makeImports` creates it when given
@@ -16,13 +16,16 @@
 //   wasm_host.http_request(req_off i32, req_len i32, res_off i32, res_cap i32) -> i32
 //     req: the request text of "wasm-fetch 1" (src/downloads.jl), res: the response text
 //     written back; returns its length (or -length when res_cap is too small: nothing
-//     written). Suspending (JSPI): the export must be called through WebAssembly.promising.
+//     written). Suspending (JSPI): the export must be called through WebAssembly.promising
+//     (promisingExports). A request while another of the module is in flight (the page called
+//     the module directly, again) throws a ReentryError into the module.
+// `fetchImpl` replaces `fetch`; `credentials` is fetch's (default 'omit').
 import { parseRequest, formatResult } from '../common/fetch.mjs';
 import { makeShimFs, posix } from './fs.mjs';
 import { perform } from './http.mjs';
 import { jspiGap, oneAtATime } from './jspi.mjs';
 
-export function makeImports({ wasi, spool, fetchImpl } = {}) {
+export function makeImports({ wasi, spool, fetchImpl, credentials } = {}) {
   const gap = jspiGap();
   if (gap) throw new Error(`wasmhost: the browser adapter needs ${gap}`);
   const fs = makeShimFs(wasi);
@@ -31,12 +34,13 @@ export function makeImports({ wasi, spool, fetchImpl } = {}) {
   const stats = { requests: 0 };
   const exclusive = oneAtATime(wasi);
   async function http_request(reqOff, reqLen, resOff, resCap) {
-    const mem = memory ?? wasi.inst.exports.memory;
+    const mem = memory ?? wasi.inst?.exports.memory;
+    if (!mem) throw new Error('wasmhost: no memory (call bindMemory or wasi.initialize first)');
     let result;
     try {
       const req = parseRequest(new TextDecoder().decode(new Uint8Array(mem.buffer, reqOff, reqLen)));
       stats.requests++;
-      result = await exclusive(() => perform(req, fs, { fetchImpl }));
+      result = await perform(req, fs, { fetchImpl, credentials });
     } catch (err) {
       result = { code: 2, message: String(err?.message ?? err), url: '', status: 0, headers: [] };
     }
@@ -45,6 +49,6 @@ export function makeImports({ wasi, spool, fetchImpl } = {}) {
     new Uint8Array(mem.buffer, resOff, bytes.length).set(bytes);   // (a fresh view: memory may have grown)
     return bytes.length;
   }
-  return { imports: { wasm_host: { http_request: new WebAssembly.Suspending(http_request) } },
+  return { imports: { wasm_host: { http_request: new WebAssembly.Suspending((...a) => exclusive(() => http_request(...a))) } },
            bindMemory(m) { memory = m; }, stats };
 }

@@ -15,7 +15,7 @@ code in `common/`.
 |---|---|---|---|---|---|---|---|
 | `common/` | (bundled into each) | any | protocol `wasm-fetch 1`, libcurl's error codes | protocol `wasm-decompress 1`, magic bytes | merging, checking, `WASMHOST_PLATFORM` | – | through Node and Chromium |
 | `node/` | `@wasmhost/node` | Node 22+ and Bun 1.4+ (`node:wasi`) | spool: `spool.mjs`; import: `imports.mjs` | spool: gzip, deflate; zstd on Node ≥ 22.15 (`node:zlib`) | `platform.mjs` (arch, os, libc) | JSPI; sync worker + `Atomics.wait` (spool) | **yes**, end to end against native |
-| `browser/` | `@wasmhost/browser` | browsers with JSPI (Chrome/Edge 137+), on `@bjorn3/browser_wasi_shim` | spool: `spool.mjs`; import: `imports.mjs` (bodies in the shim's in-memory filesystem) | spool: `DecompressionStream`: gzip, deflate; zstd where the browser has it (not Chromium 158) | none to detect | JSPI only; one request in flight per module | **yes**, end to end against native in headless Chromium 158 (Playwright); decompression: the adapter alone |
+| `browser/` | `@wasmhost/browser` | browsers with JSPI (Chrome/Edge 137+), on `@bjorn3/browser_wasi_shim` | spool: `spool.mjs`; import: `imports.mjs` (bodies in the shim's in-memory filesystem) | spool: `DecompressionStream`: gzip, deflate; zstd where the browser has it (not Chromium 158) | none to detect | JSPI only; one call at a time per module (`promisingExports`) | **yes**, end to end against native in headless Chromium 158 (Playwright); decompression: the adapter alone |
 | `workerd/` | – | Cloudflare workerd | import | `DecompressionStream` | – | JSPI if available | **no**: notes |
 | `wasmtime/` | – | wasmtime | import, from an embedding | the embedding's | the embedding's | the embedding's | **no**: notes |
 
@@ -56,20 +56,24 @@ await WebAssembly.promising(inst.exports.main)();   // mode 'sync': inst.exports
 
 ```js
 import { WASI, File, OpenFile, PreopenDirectory, ConsoleStdout } from '@bjorn3/browser_wasi_shim';
-import { wrapWasi } from './WasmHost.jl/js/browser/index.mjs';
+import { wrapWasi, makeImports, promisingExports } from './WasmHost.jl/js/browser/index.mjs';
 
 const root = new PreopenDirectory('/work', new Map());
 const wasi = new WASI(['main'], ['WASMHOST_SPOOL=/work/.wasmhost', 'PWD=/work'],
                       [new OpenFile(new File([])), ConsoleStdout.lineBuffered(console.log), ConsoleStdout.lineBuffered(console.warn), root]);
-const host = wrapWasi(wasi, { spool: '/work/.wasmhost' });     // import transport: makeImports({ wasi, spool })
+// spool transport:
+const host = wrapWasi(wasi, { spool: '/work/.wasmhost' });
 const inst = await WebAssembly.instantiate(mod, { wasi_snapshot_preview1: host.wasiImport });
+// import transport (makeImports returns { imports, bindMemory, stats }):
+//   const host = makeImports({ wasi, spool: '/work/.wasmhost' });
+//   const inst = await WebAssembly.instantiate(mod, { wasi_snapshot_preview1: wasi.wasiImport, ...host.imports });
 host.bindMemory(inst.exports.memory);
 wasi.initialize(inst);
-await WebAssembly.promising(inst.exports.main)();
+await promisingExports(inst).main();                 // one call at a time per module
 ```
 
 - Takes the shim's WASI instance rather than Node's `preopens`: the shim's preopens and its
   in-memory files are the module's filesystem, which the adapter reads and writes through the
   shim's own directory operations (no import of the shim).
-- Needs JSPI (Chrome/Edge 137+); one request in flight per module; the browser's User-Agent
-  replaces the program's; CORS applies. See [`browser/README.md`](browser/README.md).
+- Needs JSPI (Chrome/Edge 137+); one call at a time per module (`promisingExports`); the
+  browser's User-Agent replaces the program's; CORS applies; no credentials by default. See [`browser/README.md`](browser/README.md).

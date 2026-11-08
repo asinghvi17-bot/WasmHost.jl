@@ -6,6 +6,8 @@
   "license": "MIT",
   "type": "module",
   "sideEffects": false,
+  "peerDependencies": { "@bjorn3/browser_wasi_shim": "^0.4.2" },
+  "peerDependenciesMeta": { "@bjorn3/browser_wasi_shim": { "optional": true } },
   "exports": {
     ".": "./index.mjs",
     "./spool": "./spool.mjs",
