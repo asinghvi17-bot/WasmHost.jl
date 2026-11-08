@@ -2,6 +2,7 @@
 // page's (or worker's) `fetch`, the bodies read from and written to the module's in-memory
 // filesystem (`fs.mjs`).
 import { CURLE } from '../common/fetch.mjs';
+import { requestSignal } from '../common/jobs.mjs';
 
 // libcurl's code of a failed browser `fetch`. A browser reports every network failure (refused,
 // unresolved, TLS, a CORS refusal, too many redirects) as the same TypeError without detail, so
@@ -21,11 +22,13 @@ export function curlCode(err) {
 //
 // `credentials` is fetch's: 'omit' by default, so that the page's cookies and HTTP
 // authentication don't go with the program's requests (libcurl, natively, has neither);
-// 'same-origin' or 'include' to send them.
-export async function perform(req, fs, { fetchImpl = globalThis.fetch.bind(globalThis), credentials = 'omit' } = {}) {
+// 'same-origin' or 'include' to send them. `signal` aborts it (the module gave up a request it
+// started).
+export async function perform(req, fs, { fetchImpl = globalThis.fetch.bind(globalThis), credentials = 'omit', signal } = {}) {
   try {
     const init = { method: req.method, headers: req.headers, redirect: 'follow', credentials };
-    if (Number.isFinite(req.timeout)) init.signal = AbortSignal.timeout(Math.max(1, req.timeout * 1000));
+    const sig = requestSignal(req.timeout, signal);
+    if (sig) init.signal = sig;
     if (req.input) init.body = fs.read(req.input).slice();
     const r = await fetchImpl(req.url, init);
     if (req.output) fs.write(req.output, new Uint8Array(await r.arrayBuffer()));

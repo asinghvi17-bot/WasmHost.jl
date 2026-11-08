@@ -1,7 +1,7 @@
 # End-to-end checks: compile a program with WasmCodegen, run it in Node, Bun or a headless Chromium with WasmHost's
 # adapter, and compare it with native.
 #
-#   julia test/e2e/e2e.jl /path/to/WasmCodegen.jl [spool|import|decompress|all]
+#   julia test/e2e/e2e.jl /path/to/WasmCodegen.jl [spool|import|decompress|concurrent|batch|all] [spool|import]
 #
 # - spool, import: test/e2e/prog.jl (plain Downloads calls) against a local HTTP server
 #   (server.mjs). Its output and downloaded bytes must equal the same program run natively
@@ -10,6 +10,16 @@
 #   artifact tarball, gzip and zstd as the Pkg server serves it (and deflate). The decompressed
 #   bytes must equal what native Pkg's own decompressors give (`get_extract_cmd`: 7z, zstd),
 #   whose tree hash is the artifact's; the platform lines must equal the native run's.
+#
+# - concurrent: test/e2e/cprog.jl, Downloads in Julia tasks (@sync/@async, asyncmap, a task fetched later), compiled
+#   with `tasks = :jspi` and `verify = :error`, run on WasmCodegen's julia_io events and julia_task (crun.mjs) against
+#   server.mjs's tiles, each after a fixed latency (E2E_LATENCY_MS, 50 ms). Its output and files must equal native's,
+#   and each part's wall time must show the requests overlapping: under half of N x latency (N = CPROG_N, 14). Then
+#   the same module with the adapter not given the julia_io events, every request suspending the whole module (as
+#   before), for comparison (not checked).
+# - batch: test/e2e/bprog.jl, WasmHost.Downloads.request_all in a program of one task (`tasks = :none`, `verify =
+#   :error`): the host's batch. As concurrent (Node: the spool transport in both of its modes).
+#   The third argument of concurrent and batch is the transport (spool, the default, or import).
 #
 # - WASM_RUNTIME=chromium: the browser adapter (js/browser/) in Playwright's headless Chromium, driven by Node
 #   (test/e2e/browser/: `npm ci` and `npx playwright install chromium` there first). spool and import as above, with
@@ -85,7 +95,11 @@ function output(cmd)
     return out
 end
 
-const NODE_FLAGS = runtime == "node" ? `--experimental-wasm-jspi --disable-warning=ExperimentalWarning` : ``
+# (JSPI is on by default in newer Node, and Node 26 rejects --experimental-wasm-jspi: the flag only where the API is
+# missing without it, Node 22)
+jspi_flags(node) = success(pipeline(`$node -e "process.exit(typeof WebAssembly.Suspending === 'function' ? 0 : 1)"`;
+                                    stdout = devnull, stderr = devnull)) ? `` : `--experimental-wasm-jspi`
+const NODE_FLAGS = runtime == "node" ? `$(jspi_flags(node)) --disable-warning=ExperimentalWarning` : ``
 
 function build(env, wasm, transport, program)
     get(ENV, "E2E_REUSE", "") == "1" && isfile(wasm) && return
@@ -158,6 +172,67 @@ function artifacts()
     return dir
 end
 
+# the concurrent programs: cprog.jl (Julia tasks) or bprog.jl (the host's batch), native and compiled (`transport`)
+function concurrency(env, program, transport)
+    prog, mod, prefix = program == "concurrent" ? ("cprog.jl", "ConcurrentProg", "C") : ("bprog.jl", "BatchProg", "B")
+    native = output(addenv(`$node $(joinpath(HERE, "native.mjs")) $(joinpath(work, "native-$program")) $prog $mod`,
+                           "JULIA" => julia, "E2E_PROJECT" => env))
+    print("native:\n", native)
+    ok = !isempty(lines(native, prefix)) && !isempty(lines(native, "file "))
+    wasm = joinpath(work, "$program-$transport.wasm")
+    build(env, wasm, transport, program)
+    n = parse(Int, get(ENV, "CPROG_N", "14"))
+    latency = parse(Int, get(ENV, "E2E_LATENCY_MS", "50"))
+    # (the parts that make n requests at once)
+    timed = program == "concurrent" ? ("C1", "C2") : ("B1", "B2")
+    modes = transport == "import" ? ["import"] : BROWSER || program == "concurrent" ? ["jspi"] : ["jspi", "sync"]
+    for mode in modes
+        run_(events, twice = "") = BROWSER ?
+            output(`$node $(joinpath(HERE, "browser", "crun.mjs")) $wasm $mode $(joinpath(work, "chromium-$program-$mode-$events$twice")) $wcg $events $twice`) :
+            output(`$node $NODE_FLAGS $(joinpath(HERE, "crun.mjs")) $wasm $mode $(joinpath(work, "$program-$mode-$events")) $wcg $events`)
+        out = run_("events")
+        skipped(out, "$program/$transport/$mode") && continue
+        times = Dict(m[1] => parse(Int, m[2]) for m in eachmatch(r"^time (\w+) (\d+)$"m, out))
+        fast = all(t -> get(times, t, typemax(Int)) < n * latency ÷ 2, timed)
+        same = lines(out, prefix) == lines(native, prefix) && lines(out, "file ") == lines(native, "file ") &&
+               occursin("main returned 0 ", out) && occursin("spool files left: 0", out)
+        println("== $program/$transport/$mode: ", same ? "IDENTICAL to native" : "DIFFERENT", "; ",
+                join(["$t $(get(times, t, -1)) ms" for t in timed], ", "), " for $n requests of $latency ms each: ",
+                fast ? "OVERLAPPING" : "NOT OVERLAPPING", " (sequential: $(n * latency) ms)\n", out)
+        ok &= same && fast
+        if program == "concurrent"
+            # (for comparison: the adapter without the julia_io events, each request suspending the whole module)
+            before = run_("noevents")
+            tb = Dict(m[1] => parse(Int, m[2]) for m in eachmatch(r"^time (\w+) (\d+)$"m, before))
+            println("== $program/$transport/$mode without julia_io events for the adapter (each request suspends the module): ",
+                    join(["$t $(get(tb, t, -1)) ms" for t in timed], ", "), "; output ",
+                    lines(before, prefix) == lines(native, prefix) ? "identical to native" : "DIFFERENT", "\n",
+                    join(filter(l -> occursin(r"^(time|main returned|server|host)", l), split(before, '\n')), '\n'), "\n")
+            ok &= lines(before, prefix) == lines(native, prefix)
+        end
+        if BROWSER && program == "concurrent"
+            # main twice at once through promisingExports with julia_task: queued (both identical to native, one after
+            # the other), rejected (the second a ReentryError), and the adapter's re-entry guard for tasks
+            for how in ("queue", "reject")
+                o = run_("events", how)
+                want = lines(native, prefix)
+                good = occursin("main returned 0 ", o) && occursin("spool files left: 0", o)
+                if how == "queue"
+                    good &= lines(o, prefix) == vcat(want, want) && occursin("second call: 0\n", o)
+                else
+                    guard = lines(o, "task guard: ")
+                    good &= lines(o, prefix) == want && occursin(r"^second call: rejected: ReentryError: "m, o) &&
+                            length(guard) == 4 && all(endswith(": true"), guard)
+                end
+                println("== $program/$transport/$mode, main twice at once ($how): ", good ? "RIGHT" : "WRONG", "\n",
+                        join(filter(l -> occursin(r"^(main returned|second call|task guard|server)", l), split(o, '\n')), '\n'), "\n")
+                ok &= good
+            end
+        end
+    end
+    return ok
+end
+
 # (a browser: the adapter's decompression alone)
 function browser_decompression()
     out = output(`$node $(joinpath(HERE, "browser", "decompress.mjs"))`)
@@ -210,8 +285,11 @@ end
 # (the browser's decompress part compiles nothing)
 env = BROWSER && which == "decompress" ? nothing : setup_env(joinpath(work, "env"))
 ok = true
-for part in (which == "all" ? ["spool", "import", "decompress"] : [which])
-    global ok &= part == "decompress" ? decompression(env) : downloads(env, part)
+for part in (which == "all" ? ["spool", "import", "decompress", "concurrent", "batch"] : [which])
+    global ok &= part == "decompress" ? decompression(env) :
+                 part in ("concurrent", "batch") ? (which == "all" ? all(t -> concurrency(env, part, t), ("spool", "import")) :
+                                                    concurrency(env, part, get(ARGS, 3, "spool"))) :
+                 downloads(env, part)
 end
 println(ok ? "E2E PASS" : "E2E FAIL")
 exit(ok ? 0 : 1)

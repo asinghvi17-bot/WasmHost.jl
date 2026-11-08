@@ -51,6 +51,11 @@ export function makeShimFs(wasi) {
     // the guest path of a preopen's fd, or undefined
     preopenOf(fd) { const o = wasi.fds[fd]; return o?.prestat_name !== undefined ? posix.normalize(nameOf(o)) : undefined; },
     exists: (guest) => inode(guest) !== undefined,
+    // 'file', 'dir' or undefined (no such path)
+    kind(guest) {
+      const n = inode(guest);
+      return n === undefined ? undefined : n.contents instanceof Map ? 'dir' : 'file';
+    },
     // a file's bytes (the shim's own array: copy before keeping them)
     read(guest) {
       const n = inode(guest);

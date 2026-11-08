@@ -35,3 +35,27 @@ export function formatResult(r) {
   const hs = (r.headers ?? []).map(([k, v]) => `${k}: ${String(v).replace(/[\r\n]+/g, ' ')}`);
   return [PROTOCOL, r.code, (r.message ?? '').replace(/[\r\n]+/g, ' '), r.url, r.status, r.statusLine ?? '', ...hs].join('\n') + '\n';
 }
+
+// A batch of requests ("wasm-fetch-batch 1", see src/downloads.jl): for each request (response),
+// its number of lines, then its lines
+export const BATCH_PROTOCOL = 'wasm-fetch-batch 1';
+
+// the request texts of a batch's text
+export function parseBatch(text) {
+  const lines = text.split('\n');
+  if (lines[0] !== BATCH_PROTOCOL) throw new Error('wasm-fetch: not a batch of ' + BATCH_PROTOCOL);
+  const out = [];
+  let i = 1;
+  while (i < lines.length && lines[i] !== '') {
+    const k = Number(lines[i]);
+    if (!Number.isInteger(k) || k < 0 || i + k >= lines.length) throw new Error('wasm-fetch: a malformed batch');
+    out.push(lines.slice(i + 1, i + 1 + k).join('\n') + '\n');
+    i += k + 1;
+  }
+  return out;
+}
+
+// the text of a batch of response texts (each formatResult's, ending with a line break)
+export function formatBatch(texts) {
+  return [BATCH_PROTOCOL + '\n', ...texts.map((t) => `${t.split('\n').length - 1}\n${t}`)].join('');
+}

@@ -9,12 +9,17 @@ import { chromium } from 'playwright';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const MIME = { '.html': 'text/html; charset=utf-8', '.mjs': 'text/javascript', '.js': 'text/javascript', '.wasm': 'application/wasm' };
 
-// Serve the repository's files (and `wasm`, if given, as /module.wasm) on 127.0.0.1: { server, origin }
-export async function serveStatic(wasm) {
+// Serve the repository's files (and `wasm`, if given, as /module.wasm; WasmCodegen's js/, if `wcg` is its directory,
+// as /wcg/js/) on 127.0.0.1: { server, origin }
+export async function serveStatic(wasm, wcg) {
+  const WCG = wcg ? path.join(path.resolve(wcg), 'js') : null;
   const server = http.createServer((req, res) => {
     const u = new URL(req.url, 'http://x');
-    const file = u.pathname === '/module.wasm' && wasm ? wasm : path.join(ROOT, path.normalize(decodeURIComponent(u.pathname)));
-    if (!file.startsWith(ROOT + path.sep) && file !== wasm || !fs.existsSync(file) || !fs.statSync(file).isFile()) {
+    const p = path.normalize(decodeURIComponent(u.pathname));
+    const file = u.pathname === '/module.wasm' && wasm ? wasm :
+      WCG && p.startsWith('/wcg/js/') ? path.join(WCG, p.slice('/wcg/js/'.length)) : path.join(ROOT, p);
+    const inside = file.startsWith(ROOT + path.sep) || (WCG && file.startsWith(WCG + path.sep));
+    if (!inside && file !== wasm || !fs.existsSync(file) || !fs.statSync(file).isFile()) {
       res.writeHead(404); return res.end('not here\n');
     }
     res.writeHead(200, { 'content-type': MIME[path.extname(file)] ?? 'application/octet-stream', 'cache-control': 'no-store' });

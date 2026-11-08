@@ -5,7 +5,13 @@
 // - opening `<spool>/<id>.res` performs the HTTP request of `<spool>/<id>.req` first
 //   ("wasm-fetch 1", with `fetch`);
 // - opening `<spool>/<id>.dres` decompresses as `<spool>/<id>.dreq` asks ("wasm-decompress 1",
-//   with node:zlib).
+//   with node:zlib);
+// - opening `<spool>/<id>.bres` performs the batch of requests of `<spool>/<id>.breq` together
+//   ("wasm-fetch-batch 1"), their responses in it;
+// - opening `<spool>/<id>.hnd` (with `events`, for a module with Julia tasks) starts the request
+//   of `<spool>/<id>.req` without waiting and writes its julia_io handle into it; the handle
+//   becomes ready once `<spool>/<id>.res` is written. Without `events` there is no such file:
+//   the module waits for each request as a program of one task does.
 //
 //   const host = wrapWasi(wasi.wasiImport, { preopens, spool: '/work/.wasmhost', mode });
 //   const inst = await WebAssembly.instantiate(mod, { wasi_snapshot_preview1: host.wasiImport });
@@ -18,11 +24,14 @@
 //     suspended; exports that download or decompress must be called through
 //     `WebAssembly.promising` (Node: --experimental-wasm-jspi where not on by default).
 //   - 'sync': the work runs on a worker thread while the main thread blocks in `Atomics.wait`.
-// `fetchImpl` replaces `fetch` (jspi mode only; e.g. to refuse all requests).
+// `fetchImpl` replaces `fetch` (jspi mode only; e.g. to refuse all requests). `events`: the
+// julia_io events (WasmCodegen's js/julia_io.mjs, `makeJuliaIOEvents()`) a module with tasks
+// runs on (jspi mode only): its requests then overlap, each task waiting for its own.
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { parseRequest, formatResult } from '../common/fetch.mjs';
+import { parseRequest, formatResult, parseBatch, formatBatch } from '../common/fetch.mjs';
+import { checkEvents, makeJobs } from '../common/jobs.mjs';
 import { parseDecompressRequest, formatDecompressAnswer } from '../common/decompress.mjs';
 import { makeMapper } from './paths.mjs';
 import { perform } from './http.mjs';
@@ -33,13 +42,22 @@ export { makeMapper, perform, decompressFile };
 const KINDS = [
   { kind: 'fetch', res: '.res', req: '.req' },
   { kind: 'decompress', res: '.dres', req: '.dreq' },
+  { kind: 'batch', res: '.bres', req: '.breq' },
+  { kind: 'start', res: '.hnd', req: '.req' },
 ];
+
+const fetchFailure = (err) => formatResult({ code: 2, message: String(err?.message ?? err), url: '', status: 0, headers: [] });
 
 // The answer for a job that failed before it ran
 function failure(kind, err) {
-  return kind === 'fetch'
-    ? formatResult({ code: 2, message: String(err?.message ?? err), url: '', status: 0, headers: [] })
-    : formatDecompressAnswer(errnoOf(err), String(err?.message ?? err));
+  return kind === 'decompress' ? formatDecompressAnswer(errnoOf(err), String(err?.message ?? err)) : fetchFailure(err);
+}
+
+// The response text of a request (a parsed one, host paths mapped, or the Error of one that
+// isn't). Never throws.
+async function respond(req, { fetchImpl, signal } = {}) {
+  if (req instanceof Error) return fetchFailure(req);
+  try { return formatResult(await perform(req, { fetchImpl, signal })); } catch (err) { return fetchFailure(err); }
 }
 
 // Do one job (host paths mapped) and write its response file. Never throws.
@@ -47,7 +65,9 @@ export async function serve(job, { fetchImpl } = {}) {
   let text;
   try {
     if (job.kind === 'fetch') {
-      text = formatResult(await perform(job.req, { fetchImpl }));
+      text = await respond(job.req, { fetchImpl });
+    } else if (job.kind === 'batch') {
+      text = formatBatch(await Promise.all(job.reqs.map((r) => respond(r, { fetchImpl }))));
     } else {
       const [errno, message] = await decompressFile(job.srcHost, job.dstHost, job.format);
       text = formatDecompressAnswer(errno, message);
@@ -58,7 +78,7 @@ export async function serve(job, { fetchImpl } = {}) {
   fs.writeFileSync(job.resHost, text);
 }
 
-export function wrapWasi(wasiImport, { preopens = {}, spool, mode = 'jspi', fetchImpl } = {}) {
+export function wrapWasi(wasiImport, { preopens = {}, spool, mode = 'jspi', fetchImpl, events } = {}) {
   if (!spool) throw new Error('wasmhost: no spool directory');
   const map = makeMapper(preopens);
   const spoolGuest = path.posix.normalize(spool);
@@ -66,7 +86,9 @@ export function wrapWasi(wasiImport, { preopens = {}, spool, mode = 'jspi', fetc
   let memory = null;
   const decoder = new TextDecoder();
   const original = wasiImport.path_open;
-  const stats = { requests: 0, decompress: 0 };
+  const stats = { requests: 0, decompress: 0, started: 0, batches: 0 };
+  if (events != null && mode !== 'jspi') throw new Error("wasmhost: events (a module with tasks) need mode 'jspi'");
+  const jobs = checkEvents(events) && makeJobs(events, stats);
 
   // { kind, reqHost, resHost } when the path of this `path_open` is a pending response of the
   // spool, else null
@@ -76,25 +98,44 @@ export function wrapWasi(wasiImport, { preopens = {}, spool, mode = 'jspi', fetc
     const guest = path.posix.join(dir, decoder.decode(new Uint8Array(memory.buffer, pathOff, pathLen)));
     if (path.posix.dirname(guest) !== spoolGuest) return null;
     const k = KINDS.find((x) => guest.endsWith(x.res));
-    if (k === undefined) return null;
+    if (k === undefined || (k.kind === 'start' && !jobs)) return null;
     const resHost = map.toHost(guest);
     const reqHost = resHost.slice(0, -k.res.length) + k.req;
     if (fs.existsSync(resHost) || !fs.existsSync(reqHost)) return null;
     return { kind: k.kind, reqHost, resHost };
   }
+  // a request text parsed, its paths mapped (throws for a bad one)
+  function request(text) {
+    const req = parseRequest(text);
+    req.outputHost = req.output ? map.toHost(req.output) : '';
+    req.inputHost = req.input ? map.toHost(req.input) : '';
+    stats.requests++;
+    return req;
+  }
   // the job of a pending response (throws for a bad request)
   function prepare(p) {
     const text = fs.readFileSync(p.reqHost, 'utf8');
-    if (p.kind === 'fetch') {
-      const req = parseRequest(text);
-      req.outputHost = req.output ? map.toHost(req.output) : '';
-      req.inputHost = req.input ? map.toHost(req.input) : '';
-      stats.requests++;
-      return { kind: 'fetch', req, resHost: p.resHost };
+    if (p.kind === 'fetch') return { kind: 'fetch', req: request(text), resHost: p.resHost };
+    if (p.kind === 'batch') {
+      stats.batches++;
+      // (a bad request of the batch fails alone)
+      const reqs = parseBatch(text).map((t) => { try { return request(t); } catch (err) { return err; } });
+      return { kind: 'batch', reqs, resHost: p.resHost };
     }
     const d = parseDecompressRequest(text);
     stats.decompress++;
     return { kind: 'decompress', srcHost: map.toHost(d.src), dstHost: map.toHost(d.dst), format: d.format, resHost: p.resHost };
+  }
+
+  // (a module with tasks) start the request of `<id>.req` and write its handle into `<id>.hnd`;
+  // `<id>.res` once it is done (unless the module gave it up)
+  function start(p) {
+    let req;
+    try { req = request(fs.readFileSync(p.reqHost, 'utf8')); } catch (err) { req = err; }
+    const resHost = p.reqHost.slice(0, -'.req'.length) + '.res';
+    stats.started++;
+    const h = jobs.start((signal) => respond(req, { fetchImpl, signal }), (text) => { fs.writeFileSync(resHost, text); });
+    fs.writeFileSync(p.resHost, String(h));
   }
 
   let path_open;
@@ -104,6 +145,8 @@ export function wrapWasi(wasiImport, { preopens = {}, spool, mode = 'jspi', fetc
     path_open = new WebAssembly.Suspending((...args) => {
       const p = pending(args[0], args[2], args[3]);
       if (p === null) return original(...args);
+      // (no suspension: the module goes on, the request runs)
+      if (p.kind === 'start') { start(p); return original(...args); }
       return (async () => {
         let job;
         try { job = prepare(p); } catch (err) { fs.writeFileSync(p.resHost, failure(p.kind, err)); return original(...args); }

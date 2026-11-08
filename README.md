@@ -77,9 +77,42 @@ module contains no libcurl. `Downloads.download` is Downloads' own and calls `re
   runtimes, zstd) itself, and browsers don't let a program set `Accept-Encoding`. libcurl, as
   Downloads uses it, writes the raw bytes.
 - **Redirect limit:** `fetch`'s is 20, where Downloads asks libcurl for 50.
-- **Waiting with Julia Tasks:** a request blocks the whole module: other Julia tasks don't run
-  while it waits. Concurrent requests would need the host's event loop to wait on request
-  handles.
+
+### Concurrent requests
+
+Requests written as ordinary Julia overlap, as they do natively:
+
+```julia
+@sync for (url, io) in zip(urls, ios)
+    @async Downloads.request(url; output = io)
+end
+paths = asyncmap(url -> Downloads.download(url, joinpath(dir, basename(url))), urls)
+t = @async Downloads.download(url, IOBuffer()); ...; body = take!(fetch(t)::IOBuffer)
+```
+
+- **With Julia tasks** (`WasmCodegen.Config(tasks = :jspi, host_extensions = [:julia_io])`):
+  each `Downloads.request` is started by the host, which returns at once with a handle of
+  WasmCodegen's `julia_io` events (spool: opening `<id>.hnd`; import: `wasm_host.http_start`).
+  The task waits for that handle as it waits for a `Timer` (`Runtime.Host.await_handle`): it
+  is parked in the scheduler, the other tasks run, and the module suspends (JSPI) only when
+  every task waits, until any of their handles is ready (one `julia_io.poll` over all of them).
+  The host side: give the adapter the same `julia_io` events the module runs on
+  (`wrapWasi(..., { events })`, `makeImports({ events })`, in Node and in the browser). Without
+  them each request waits as before, suspending the whole module. Needs a WasmCodegen whose
+  `julia_io.mjs` has external handles (`events.external`) and with `Runtime.Tasks.enabled()`.
+  `asyncmap` compiles with that WasmCodegen too (its task patches type Base's).
+- **In a program of one task** (`tasks = :none`, where `@async` can't wait):
+  `WasmHost.Downloads.request_all(urls; outputs, method, headers, timeout, throw)` hands the
+  host all the requests at once (`wasm-fetch-batch 1`: `<id>.breq`/`<id>.bres`, or
+  `wasm_host.http_batch`), which it performs together; one wait for all. Natively (with
+  Downloads loaded, `WasmHostRequestAllExt`) it is `asyncmap` over `Downloads.request`, so the
+  program runs the same natively.
+
+Measured (test/e2e, 14 requests to a local server with 50 ms latency; sequential is 700 ms):
+`@sync`/`@async` 75–98 ms in Node (all 14 in flight at once) and 163 ms in headless Chromium
+(at most 6 in flight: the browser's connections per host for HTTP/1.1; 66 ms for 6 requests);
+`request_all` in a program of one task 69–106 ms in Node, 165 ms in Chromium. Without the
+`julia_io` events the same `@sync`/`@async` module takes 744–763 ms.
 
 ## Decompress
 
@@ -218,6 +251,9 @@ protocols in `js/common/`. See [`js/README.md`](js/README.md).
   own runtime replaces methods. (`@wasm_method` is `Base.Experimental.@overlay` on it.) It isn't
   yet a supported interface for packages; that is being asked upstream.
 - **`WasmCodegen.Runtime.Staging`:** used by the import transport only.
+- **`WasmCodegen.Runtime.Host.await_handle`, `Runtime.Host.close`, `Runtime.Tasks.enabled`:**
+  the concurrent requests (a task's wait for a host handle). Without `Runtime.Tasks.enabled`
+  (an older WasmCodegen), requests wait as in a program of one task.
 
 Expect to update this package when either changes.
 
@@ -241,8 +277,16 @@ Expect to update this package when either changes.
     import as above, the test resources on another origin than the page (CORS); the User-Agent
     the server echoes must be the browser's. `decompress`: the adapter's decompression alone.
 
+  - `concurrent`: `test/e2e/cprog.jl` (`@sync`/`@async`, `asyncmap`, a task fetched later, a
+    failure in `@sync`), built with `tasks = :jspi` and `verify = :error`, against the local
+    server's tiles with a fixed latency. The output and files must equal native's and the wall
+    times must show the requests overlapping; then the same module without the `julia_io`
+    events for the adapter (each request suspending the module), for comparison.
+  - `batch`: `test/e2e/bprog.jl`, `WasmHost.Downloads.request_all` in a program of one task
+    (`verify = :error`), the same checks.
+
   ```
-  julia test/e2e/e2e.jl /path/to/WasmCodegen.jl [spool|import|decompress|all]
+  julia test/e2e/e2e.jl /path/to/WasmCodegen.jl [spool|import|decompress|concurrent|batch|all] [spool|import]
   ```
 
 ## License

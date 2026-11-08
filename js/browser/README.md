@@ -33,8 +33,9 @@ const exports = promisingExports(inst);                     // every call into t
 await exports.main();
 ```
 
-- `promisingExports(instance, { whenBusy })`: the instance's function exports, each through
-  `WebAssembly.promising` (so each returns a promise), one call at a time: a call made while
+- `promisingExports(instance, { whenBusy, tasks })`: the instance's function exports, each through
+  `WebAssembly.promising` (so each returns a promise; with `tasks`, a module with Julia tasks,
+  through WasmCodegen's julia_task `tasks.call`, and without `jl_task_entry`), one call at a time: a call made while
   another is in flight waits for it to settle (`whenBusy: 'queue'`, the default) or is rejected
   with a `ReentryError` (`'reject'`). Call the module only through these (see
   [one call at a time](#requirements-and-limits)).
@@ -53,6 +54,31 @@ await exports.main();
   don't go with the program's requests, as natively libcurl has neither. Pass `'same-origin'` or
   `'include'` to send them (a cross-origin server must then name the origin and allow
   credentials).
+- **A module with Julia tasks** (`Config(tasks = :jspi)`): its requests overlap when the
+  adapter has the module's `julia_io` events:
+
+  ```js
+  const { makeJuliaIOEvents } = await import('./WasmCodegen.jl/js/julia_io.mjs');
+  const { makeJuliaTask } = await import('./WasmCodegen.jl/js/julia_task.mjs');
+  const events = makeJuliaIOEvents(), paths = makeShimJuliaIOPaths(wasi);
+  const jt = makeJuliaTask({ events, keepAlive: false });
+  const host = wrapWasi(wasi, { spool: '/work/.wasmhost', events });      // or makeImports({ ..., events })
+  const inst = await WebAssembly.instantiate(mod, { wasi_snapshot_preview1: host.wasiImport,
+    julia_io: { ...paths.imports, ...events.imports }, ...jt.imports });
+  host.bindMemory(inst.exports.memory); events.bindMemory(inst.exports.memory); paths.bindMemory(inst.exports.memory);
+  wasi.initialize(inst); jt.bind(inst);
+  await promisingExports(inst, { tasks: jt }).main();
+  ```
+
+  A request starts without suspending (`<id>.hnd`, `wasm_host.http_start`); the task waits for
+  its `julia_io` handle while the others run. The re-entry guard then refuses a start, or a
+  suspending job, while the module is suspended in a job or in julia_io's `poll`
+  (`notSuspended`, `oneAtATime(wasi, events)`); starts of the running call's tasks overlap
+  freely. The browser opens at most 6 connections per host for HTTP/1.1, so more requests to
+  one host than that overlap in rounds.
+- `makeShimJuliaIOPaths(wasi)`: `julia_io`'s `path_mode`, `path_chmod`, `path_symlink` on the
+  shim (no permission bits, no links: a file is 0o100644, a directory 0o040755), which a module
+  built with `host_extensions = [:julia_io]` imports; WasmCodegen's own are Node's.
 - `makeShimFs(wasi)` is the adapter's view of the shim's preopens (read and write a file by
   guest path), for a page that puts inputs in or takes results out.
 

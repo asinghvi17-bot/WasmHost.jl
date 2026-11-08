@@ -50,7 +50,16 @@ await WebAssembly.promising(inst.exports.main)();   // mode 'sync': inst.exports
   wrapper: a `WebAssembly.Suspending` can't be wrapped twice.
 - `platformEnv(overrides)` is `{ WASMHOST_PLATFORM: "arch=…;os=…;libc=…" }`, the detected tags
   with `overrides` (an object) applied key by key.
-- `makeImports({ preopens })` is the import transport's `{ wasm_host: { http_request } }`.
+- `makeImports({ preopens, events })` is the import transport's `{ wasm_host: { http_request,
+  http_start, http_finish, http_batch, http_batch_result } }`.
+- **Concurrent requests** (a module with Julia tasks, `Config(tasks = :jspi)`): pass the
+  `julia_io` events the module runs on, WasmCodegen's `makeJuliaIOEvents()`, as `events` to
+  `wrapWasi` (mode `'jspi'`) or `makeImports`. A request then starts without suspending the
+  module and returns an external `julia_io` handle (`events.external()`), ready when the
+  response is there: the module's task waits for it alone, its other tasks run, and their
+  requests overlap. Run the module's exports through WasmCodegen's julia_task (`jt.call`).
+  Batches of requests (`WasmHost.Downloads.request_all`) need nothing: both transports and both
+  spool modes perform a batch's requests together.
 
 ## Browser (`@wasmhost/browser`)
 
@@ -75,5 +84,8 @@ await promisingExports(inst).main();                 // one call at a time per m
 - Takes the shim's WASI instance rather than Node's `preopens`: the shim's preopens and its
   in-memory files are the module's filesystem, which the adapter reads and writes through the
   shim's own directory operations (no import of the shim).
+- Concurrent requests as in Node (`events`); the module's other `julia_io` imports are
+  WasmCodegen's events (they load in browsers) and `makeShimJuliaIOPaths(wasi)` (file modes on
+  the shim); call its exports through `promisingExports(inst, { tasks: jt })`.
 - Needs JSPI (Chrome/Edge 137+); one call at a time per module (`promisingExports`); the
   browser's User-Agent replaces the program's; CORS applies; no credentials by default. See [`browser/README.md`](browser/README.md).

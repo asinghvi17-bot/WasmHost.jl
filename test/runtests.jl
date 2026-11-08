@@ -4,7 +4,7 @@
 # test/e2e/e2e.jl.
 using Test, WasmHost
 using WasmHost: split_lines, spool_dir
-using WasmHost.Downloads: request_text, parse_result, Result
+using WasmHost.Downloads: request_text, parse_result, Result, Request, batch_text, parse_batch, request_batch
 using WasmHost.Decompress: DecompressError, decompress, parse_answer
 using Base.BinaryPlatforms: HostPlatform, triplet, arch, os, libc
 
@@ -67,6 +67,39 @@ const NOSPOOL = ("WASMHOST_SPOOL" => nothing, "WASM_FETCH_SPOOL" => nothing)
         withenv("WASMHOST_SPOOL" => dir) do
             r = WasmHost.Downloads.request("http://h/x", "GET", Pair{String,String}[], "", "", Inf)
             @test r.code == 2 && occursin("no response", r.message)
+        end
+        @test isempty(readdir(dir))
+    end
+
+    @testset "Downloads: batches" begin
+        a = request_text("http://h/a", "GET", Pair{String,String}[], "", "/w/a", Inf)
+        b = request_text("http://h/b", "HEAD", ["X" => "y"], "", "", 2.0)
+        t = batch_text([a, b])
+        @test t == "wasm-fetch-batch 1\n6\n" * a * "7\n" * b
+        # a response of two results, one of no headers
+        r1 = "wasm-fetch 1\n0\n\nhttp://h/a\n200\nHTTP/1.1 200 OK\ncontent-type: text/plain\n"
+        r2 = "wasm-fetch 1\n7\nrefused\nhttp://h/b\n0\n\n"
+        ls = parse_batch("wasm-fetch-batch 1\n7\n" * r1 * "6\n" * r2, 2)
+        @test ls == [split_lines(r1), split_lines(r2)]
+        @test parse_result(ls[1], "u").headers == ["content-type" => "text/plain"]
+        @test parse_result(ls[2], "u").code == 7
+        # malformed: another protocol, too few responses, a count beyond the end
+        @test parse_batch("wasm-fetch-batch 2\n6\n" * r2, 1) === nothing
+        @test parse_batch("wasm-fetch-batch 1\n6\n" * r2, 2) === nothing
+        @test parse_batch("wasm-fetch-batch 1\n9\n" * r2, 1) === nothing
+        # natively: no tasks, and no host
+        @test WasmHost.Downloads.concurrent() === false
+        reqs = [Request("http://h/a", "GET", Pair{String,String}[], "", "", Inf), Request("http://h/b", "GET", Pair{String,String}[], "", "", Inf)]
+        withenv(NOSPOOL...) do
+            rs = request_batch(reqs)
+            @test length(rs) == 2 && all(r -> r.code == 2 && occursin("WASMHOST_SPOOL", r.message), rs)
+            @test [r.url for r in rs] == ["http://h/a", "http://h/b"]
+        end
+        # a spool directory but no adapter: no batch, then each request, each without a response; nothing left
+        dir = mktempdir()
+        withenv("WASMHOST_SPOOL" => dir) do
+            rs = request_batch(reqs)
+            @test all(r -> r.code == 2 && occursin("no response", r.message), rs)
         end
         @test isempty(readdir(dir))
     end
@@ -151,6 +184,90 @@ const NOSPOOL = ("WASMHOST_SPOOL" => nothing, "WASM_FETCH_SPOOL" => nothing)
             r = parse_result(split_lines(out), "http://h/x?a=1")
             @test (r.code, r.url, r.status, r.status_line) == (0, "http://h/x?a=1#final", 201, "HTTP/1.1 201 Created")
             @test r.headers == ["x-echo" => """["POST","/w/out","/w/in",3,[["X-Probe","v: w"]]]"""]
+        end
+    end
+
+    # a batch Julia writes, as the JavaScript adapter parses it, and its responses as Julia parses them
+    @testset "JavaScript: batch round trip" begin
+        if node === nothing
+            @test_skip "$runtime not found"
+        else
+            texts = [request_text("http://h/$i", "GET", ["X-I" => string(i)], "", "/w/$i", Inf) for i in 1:3]
+            script = """
+            import { parseBatch, formatBatch, parseRequest, formatResult } from $(js("common", "fetch.mjs"));
+            const reqs = parseBatch(process.argv.at(-1)).map(parseRequest);
+            process.stdout.write(formatBatch(reqs.map((r, i) => formatResult({ code: 0, message: '', url: r.url, status: 200 + i,
+              statusLine: 'HTTP/1.1 200 OK', headers: [['x-echo', r.output + ' ' + r.headers[0][1]]] }))));
+            """
+            out = read(`$node --input-type=module -e $script $(batch_text(texts))`, String)
+            ls = parse_batch(out, 3)
+            @test ls !== nothing
+            rs = [parse_result(l, "u") for l in ls]
+            @test [(r.url, r.status, r.headers) for r in rs] == [("http://h/$i", 199 + i, ["x-echo" => "/w/$i $i"]) for i in 1:3]
+        end
+    end
+
+    # requests started without waiting, on julia_io events (a fake of WasmCodegen's, with external handles): the
+    # handle at once, ready when the request is done; a closed handle aborts its request and drops its result; and the
+    # Node adapter's imports http_start and http_finish on a memory (http_batch, which suspends: the e2e)
+    @testset "JavaScript: started requests" begin
+        if node === nothing
+            @test_skip "$runtime not found"
+        else
+            script = """
+            import { makeJobs, checkEvents } from $(js("common", "jobs.mjs"));
+            import { makeImports } from $(js("node", "imports.mjs"));
+            const out = [];
+            const fake = () => {
+              const hs = new Map(); let next = 1;
+              return { hs, external({ onClose }) { const h = next++; hs.set(h, { ready: false, onClose }); return h; },
+                       ready(h) { const x = hs.get(h); if (!x) return false; x.ready = true; return true; },
+                       close(h) { const x = hs.get(h); hs.delete(h); x?.onClose?.(h); } };
+            };
+            let threw = false; try { checkEvents({}); } catch { threw = true; }
+            out.push(['events without external handles refused', threw, checkEvents(undefined) === null]);
+            const ev = fake(), stats = {};
+            const jobs = makeJobs(ev, stats);
+            let release, aborted = false;
+            const h1 = jobs.start(() => new Promise((r) => { release = r; }));
+            const h2 = jobs.start((signal) => new Promise((r) => signal.addEventListener('abort', () => { aborted = true; r('late'); })));
+            out.push(['handles at once, not ready', h1 === 1 && h2 === 2 && !ev.hs.get(1).ready && stats.inFlight === 2]);
+            await new Promise((r) => setTimeout(r, 0));   // (the jobs start in a microtask)
+            release('one');
+            await new Promise((r) => setTimeout(r, 10));
+            out.push(['ready when done, the result kept', ev.hs.get(1).ready && jobs.result(1) === 'one']);
+            ev.close(2);
+            await new Promise((r) => setTimeout(r, 10));
+            out.push(['a closed handle: aborted, dropped', aborted && jobs.result(2) === undefined && stats.inFlight === 0 && stats.maxInFlight === 2]);
+            // the imports, on a memory, with a fetch that answers after a while
+            const mem = new WebAssembly.Memory({ initial: 1 });
+            const seen = [];
+            const fetchImpl = async (url) => { seen.push(url); await new Promise((r) => setTimeout(r, 20)); return new Response('x', { status: 203 }); };
+            const ev2 = fake();
+            const host = makeImports({ events: ev2, fetchImpl });
+            host.bindMemory(mem);
+            const put = (s, off) => { const b = new TextEncoder().encode(s); new Uint8Array(mem.buffer, off, b.length).set(b); return b.length; };
+            const get = (off, n) => new TextDecoder().decode(new Uint8Array(mem.buffer, off, n));
+            const req = (u) => ['wasm-fetch 1', 'GET', u, '', '', 'inf'].join('\\n') + '\\n';
+            const t0 = performance.now();
+            const ha = host.imports.wasm_host.http_start(0, put(req('http://h/a'), 0));
+            const hb = host.imports.wasm_host.http_start(0, put(req('http://h/b'), 0));
+            const started = performance.now() - t0;
+            await new Promise((r) => setTimeout(r, 0));
+            out.push(['http_start returns at once, both fetching', ha > 0 && hb > ha && started < 15 && seen.length === 2]);
+            out.push(['http_finish before ready: 0', host.imports.wasm_host.http_finish(ha, 1024, 4096) === 0]);
+            await new Promise((r) => setTimeout(r, 60));
+            const n = host.imports.wasm_host.http_finish(hb, 1024, 4096);
+            out.push(['http_finish once ready: the response', ev2.hs.get(hb).ready && n > 0 && get(1024, n).split('\\n')[4] === '203']);
+            out.push(['http_finish into a small buffer: -length', host.imports.wasm_host.http_finish(ha, 1024, 4) === -n]);
+            out.push(['without events: -ENOSYS', makeImports({}).imports.wasm_host.http_start(0, 0) === -52]);
+            process.stdout.write(out.map(([w, ...ok]) => w + ': ' + ok.every(Boolean)).join('\\n'));
+            """
+            res = split(read(`$node --input-type=module -e $script`, String), '\n')
+            @test length(res) == 9
+            for l in res
+                @test endswith(l, ": true")
+            end
         end
     end
 
