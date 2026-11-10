@@ -94,7 +94,7 @@ lines(s, prefix) = filter(l -> startswith(l, prefix) && (length(prefix) > 1 || (
 function skipped(out, what)
     m = match(r"^SKIP: (.*)$"m, out)
     m === nothing && return false
-    println("== $what: SKIPPED on $runtime, an engine gap: ", m[1])
+    println("== $what: SKIPPED on $runtime: ", m[1])
     get(ENV, "E2E_ALLOW_SKIP", "1") == "1" || (global ok = false)
     return true
 end
@@ -351,12 +351,14 @@ end
 env = (BROWSER && which == "decompress") || which == "makie" ? nothing : setup_env(joinpath(work, "env"))
 ok = true
 for part in (which == "all" ? ["spool", "import", "decompress", "concurrent", "batch", "bridge"] : [which])
-    global ok &= part == "decompress" ? decompression(env) :
-                 part == "bridge" ? bridge(env) :
-                 part == "makie" ? makie() :
-                 part in ("concurrent", "batch") ? (which == "all" ? all(t -> concurrency(env, part, t), ("spool", "import")) :
-                                                    concurrency(env, part, get(ARGS, 3, "spool"))) :
-                 downloads(env, part)
+    # (the part first: a skip it refuses sets `ok` itself)
+    good = part == "decompress" ? decompression(env) :
+           part == "bridge" ? bridge(env) :
+           part == "makie" ? makie() :
+           part in ("concurrent", "batch") ? (which == "all" ? all(t -> concurrency(env, part, t), ("spool", "import")) :
+                                              concurrency(env, part, get(ARGS, 3, "spool"))) :
+           downloads(env, part)
+    global ok &= good
 end
 println(ok ? "E2E PASS" : "E2E FAIL")
 exit(ok ? 0 : 1)
