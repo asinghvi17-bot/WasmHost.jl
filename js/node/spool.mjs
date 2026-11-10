@@ -40,6 +40,7 @@ import { parseDecompressRequest, formatDecompressAnswer } from '../common/decomp
 import { makeMapper } from './paths.mjs';
 import { perform } from './http.mjs';
 import { decompressFile, errnoOf } from './decompress.mjs';
+import { serveBridgeFile } from '../common/bridge.mjs';
 
 export { makeMapper, perform, decompressFile };
 
@@ -144,17 +145,15 @@ export function wrapWasi(wasiImport, { preopens = {}, spool, mode = 'jspi', fetc
     fs.writeFileSync(p.resHost, String(h));
   }
 
-  // the bridge's two files (no suspension: the module goes on). Never throws.
+  // the bridge's two files (no suspension: the module goes on). Throws only when the answer can't be written.
   function bridged(p) {
-    if (p.kind === 'bsend') {
-      let ans = 'ok';
-      try { bridge.send(new Uint8Array(fs.readFileSync(p.reqHost))); } catch (err) { ans = `error: ${String(err?.message ?? err)}`; }
-      fs.writeFileSync(p.resHost, ans);
-    } else {
-      const inbHost = p.reqHost.slice(0, -'.rq'.length) + '.inb';
-      const wait = fs.readFileSync(p.reqHost, 'utf8') === 'wait';
-      fs.writeFileSync(p.resHost, String(bridge.startRecv(wait, (bytes) => { fs.writeFileSync(inbHost, bytes); })));
-    }
+    const inbHost = p.reqHost.slice(0, -'.rq'.length) + '.inb';
+    serveBridgeFile(bridge, p.kind, {
+      read: () => new Uint8Array(fs.readFileSync(p.reqHost)),
+      answer: (text) => fs.writeFileSync(p.resHost, text),
+      writeInbox: (bytes) => fs.writeFileSync(inbHost, bytes),
+      removeInbox: () => fs.rmSync(inbHost, { force: true }),
+    });
   }
 
   let path_open;

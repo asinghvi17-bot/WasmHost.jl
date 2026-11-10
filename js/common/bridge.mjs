@@ -1,19 +1,31 @@
-// The host's side of WasmHost.Bridge ("wasm-bridge 1", src/bridge.jl): a message channel between the
-// module and the page, both ways. No Node or browser API is used here.
+// The host's side of WasmHost.Bridge ("wasm-bridge 1", src/bridge.jl; docs/bridge.md): a message channel between
+// the module and the page, both ways. No Node or browser API is used here.
 //
-//   const bridge = makeBridge({ events, onMessage: (value) => ... });   // events: the julia_io events
-//   const host = wrapWasi(..., { bridge });                             // the adapter serves the module's side
+//   const bridge = makeBridge({ events, onMessage: (value) => ..., onAsk: async (request) => answer });
+//   const host = wrapWasi(..., { events, bridge });                     // the adapter serves the module's side
 //   bridge.post({ msg_type: '0', id: obsId, payload: ... });            // page -> module
+//   bridge.close('page closed');                                        // the end: the module's recv and asks fail
 //
 // - Module to page: the module opens `<id>.snd` after writing `<id>.out`; the adapter calls
-//   `bridge.send(bytes)`, which decodes the frame and calls `onMessage(value, bytes)`. Synchronous: it never
-//   suspends the module.
+//   `bridge.send(bytes)`, which decodes the frame and calls `onMessage(value, bytes)` (or `onAsk`, for a request of
+//   `Bridge.ask`). Synchronous: it never suspends the module. What `onMessage` throws is the module's `send` error.
 // - Page to module: `bridge.post(value)` queues a frame. The module's `recv` opens `<id>.rcv` after writing
 //   `<id>.rq`; the adapter calls `bridge.startRecv(wait, write)`. If a frame is queued (or the module does not
 //   wait) the frames are written at once (`write(bytes)`, the `<id>.inb` file) and the handle is `0`; else an
 //   external julia_io handle (`events.external()`) is returned, and made ready, with the frames written first,
 //   when the page posts one. So a page's event never calls into the module: it completes the handle of the call in
 //   flight (which the module waits for as for a timer), or waits in the queue for the next `recv`.
+// - Frames leave the queue only once they are written: a `write` that throws leaves them queued, and the module's
+//   receive fails (`startRecv` answers -EIO; a parked receive's handle is made ready with the error as its message
+//   and no `<id>.inb`): no receive is stranded, no frame is lost.
+// - The queue is bounded (`capacity` frames, `maxBytes` bytes). When it is full, `overflow: 'reject'` (the default)
+//   makes `post` throw a BridgeFullError and queue nothing (the page's backpressure: `room()` says how much fits);
+//   `'drop-oldest'` drops the oldest frames to make room (for events that only matter as the latest state). Replies
+//   to the module's asks are always queued (the module's asks bound them). One receive takes at most `chunkBytes`
+//   of frames (at least one frame); the rest is there at once for the next.
+// - Closing: `bridge.close(reason)` (the page goes away) drops the queue, fails a parked receive and every later one
+//   (the module's `recv` throws a BridgeClosedError, its pending asks too), and makes `post` throw a
+//   BridgeClosedError. The module closes it too (`Bridge.close`, or its `serve` ending): `onClose(reason, 'module')`.
 //
 // A frame is `u32le header_length | header (JSON) | blobs`: typed arrays are in the blobs, 8-byte aligned, and the
 // JSON holds `{"$b": [offset, bytes, "f32"]}` in their place; decoded they are typed arrays again. `NaN` and
@@ -67,65 +79,175 @@ export function decodeFrame(bytes) {
         const [off, n, tag] = ref;
         const C = ARRAYS[tag];
         if (!C) throw new Error(`wasmhost bridge: unknown blob type ${tag}`);
-        // (a copy: aligned, and the frame's memory is not kept)
-        return new C(b.slice(blobStart + off, blobStart + off + n).buffer);
+        if (!(off >= 0 && n >= 0 && blobStart + off + n <= b.length && n % C.BYTES_PER_ELEMENT === 0))
+          throw new Error('wasmhost bridge: a blob out of range');
+        // (a copy of exactly its bytes: aligned, and the frame's memory is not kept; not `slice`, which is a view
+        // of the pool for a Node Buffer)
+        return new C(new Uint8Array(b.subarray(blobStart + off, blobStart + off + n)).buffer);
       }
     }
     return v;
   });
 }
 
-const EBUSY = 10;   // (WASI errno)
+const EBUSY = 10, EIO = 29, EPIPE = 64;   // (WASI errnos)
+// the message of a parked receive's handle when the bridge closed (src/bridge.jl reads it: no `<id>.inb`)
+export const CLOSED_PREFIX = 'wasm-bridge closed: ';
 
-export function makeBridge({ events = null, onMessage = () => {} } = {}) {
+/** A post, or a receive of the module, on a closed bridge. `reason`: why it closed. */
+export class BridgeClosedError extends Error {
+  constructor(reason) { super(`wasmhost bridge: closed (${reason})`); this.name = 'BridgeClosedError'; this.reason = reason; }
+}
+/** A post that does not fit in the queue (`overflow: 'reject'`), or a frame larger than the whole queue. */
+export class BridgeFullError extends Error {
+  constructor(message) { super(message); this.name = 'BridgeFullError'; }
+}
+
+const errText = (err) => String(err?.message ?? err);
+
+export function makeBridge({ events = null, onMessage = () => {}, onAsk = null, onClose = () => {},
+                             capacity = 1024, maxBytes = 16 << 20, chunkBytes = 1 << 20, overflow = 'reject' } = {}) {
+  if (overflow !== 'reject' && overflow !== 'drop-oldest') throw new Error(`wasmhost bridge: overflow ${overflow}: 'reject' or 'drop-oldest'`);
+  if (!(capacity >= 1 && maxBytes >= 1 && chunkBytes >= 1)) throw new Error('wasmhost bridge: capacity, maxBytes and chunkBytes must be positive');
   const inbox = [];            // frames (Uint8Array) the page posted, not yet taken by the module
+  let queued = 0;              // their bytes
   let waiting = null;          // { h, write } of a pending recv
-  const stats = { posted: 0, sent: 0, delivered: 0, parked: 0 };
+  let closed = null;           // why the bridge closed, once it has
+  // (posted: frames queued; sent: frames of the module; delivered: frames taken by the module, in `receives` writes;
+  // parked: receives that waited; dropped, refused: frames of a full queue (overflow), or dropped by a close)
+  const stats = { posted: 0, sent: 0, delivered: 0, receives: 0, parked: 0, dropped: 0, refused: 0, writeErrors: 0 };
 
-  function take() {
-    const frames = inbox.splice(0);
-    let n = 0;
-    for (const f of frames) n += 4 + f.length;
-    const out = new Uint8Array(n);
+  function enqueue(frame, isReply) {
+    if (closed !== null) throw new BridgeClosedError(closed);
+    if (frame.length > maxBytes) { stats.refused++; throw new BridgeFullError(`wasmhost bridge: a frame of ${frame.length} bytes is larger than the queue (maxBytes ${maxBytes})`); }
+    if (!isReply) {
+      const full = () => inbox.length >= capacity || queued + frame.length > maxBytes;
+      if (full() && overflow === 'reject') {
+        stats.refused++;
+        throw new BridgeFullError(`wasmhost bridge: the queue is full (${inbox.length} frames, ${queued} bytes; capacity ${capacity}, maxBytes ${maxBytes})`);
+      }
+      while (full() && inbox.length > 0) { queued -= inbox.shift().length; stats.dropped++; }
+    }
+    inbox.push(frame);
+    queued += frame.length;
+    stats.posted++;
+    wake();
+  }
+  // write the next chunk of frames (`u32le length | frame`, repeated; at most chunkBytes, at least one frame), and
+  // take them off the queue once `write` returned (it may throw: they stay queued)
+  function deliver(write) {
+    let n = 0, size = 0;
+    while (n < inbox.length && (n === 0 || size + 4 + inbox[n].length <= chunkBytes)) size += 4 + inbox[n++].length;
+    const out = new Uint8Array(size);
     const dv = new DataView(out.buffer);
     let at = 0;
-    for (const f of frames) { dv.setUint32(at, f.length, true); out.set(f, at + 4); at += 4 + f.length; }
-    stats.delivered += frames.length;
-    return out;
+    for (let k = 0; k < n; k++) { const f = inbox[k]; dv.setUint32(at, f.length, true); out.set(f, at + 4); at += 4 + f.length; }
+    write(out);
+    for (let k = 0; k < n; k++) queued -= inbox[k].length;
+    inbox.splice(0, n);
+    stats.delivered += n;
+    stats.receives++;
   }
   function wake() {
     if (waiting === null || inbox.length === 0) return;
     const w = waiting;
     waiting = null;
-    w.write(take());
+    try { deliver(w.write); } catch (err) {
+      // (the frames stay queued; the module's recv fails with this message instead of waiting for ever)
+      stats.writeErrors++;
+      events.ready(w.h, `wasm-bridge: the frames could not be written: ${errText(err)}`);
+      return;
+    }
     events.ready(w.h);
   }
-  return {
+  function shut(reason, by) {
+    if (closed !== null) return false;
+    closed = String(reason);
+    stats.dropped += inbox.length;
+    inbox.length = 0;
+    queued = 0;
+    if (waiting !== null) { const w = waiting; waiting = null; events.ready(w.h, CLOSED_PREFIX + closed); }
+    try { onClose(closed, by); } catch { /* (the page's callback: not the module's error) */ }
+    return true;
+  }
+  function postReply(id, result) {
+    if (closed !== null) return;   // (the module gave up its asks when it closed)
+    let frame;
+    try { frame = encodeFrame(result); } catch (err) { frame = encodeFrame({ bridge_reply: id, error: `the answer can't be encoded: ${errText(err)}` }); }
+    enqueue(frame, true);
+  }
+  const bridge = {
     stats,
-    // page -> module: queue `value`; a pending recv of the module is completed
-    post(value) {
-      inbox.push(encodeFrame(value));
-      stats.posted++;
-      wake();
+    // page -> module: queue `value`; a pending recv of the module is completed. Throws a BridgeClosedError once
+    // closed, a BridgeFullError when it does not fit (overflow 'reject')
+    post(value) { enqueue(encodeFrame(value), false); },
+    // the answer to the module's `Bridge.ask` of id `id`: a value, or a promise of one; a rejection is the ask's error
+    reply(id, answer) {
+      Promise.resolve(answer).then((value) => postReply(id, { bridge_reply: id, value }),
+                                   (err) => postReply(id, { bridge_reply: id, error: errText(err) }));
     },
-    // frames waiting for the module
+    // frames waiting for the module, and their bytes
     pending: () => inbox.length,
+    pendingBytes: () => queued,
+    // what a post may still queue without overflowing
+    room: () => ({ frames: Math.max(0, capacity - inbox.length), bytes: Math.max(0, maxBytes - queued) }),
     // whether the module is parked in recv
     parked: () => waiting !== null,
+    // why it closed, or null while open
+    closed: () => closed,
+    // the end of the bridge, from the page (it goes away): see the header
+    close(reason = 'closed by the page') { shut(reason, 'page'); },
     // module -> page (the adapter calls it for `<id>.snd`)
     send(bytes) {
+      if (closed !== null) throw new BridgeClosedError(closed);
+      const value = decodeFrame(bytes);
       stats.sent++;
-      onMessage(decodeFrame(bytes), bytes);
+      if (value !== null && typeof value === 'object' && typeof value.bridge_close === 'string') { shut(value.bridge_close, 'module'); return; }
+      if (onAsk && value !== null && typeof value === 'object' && Number.isInteger(value.bridge_ask)) {
+        const id = value.bridge_ask;
+        bridge.reply(id, new Promise((resolve) => resolve(onAsk(value, bytes))));
+        return;
+      }
+      onMessage(value, bytes);
     },
-    // the adapter calls it for `<id>.rcv`: the handle for `<id>.rcv` (0: `write` was called with the frames)
-    // or a negative errno
+    // the adapter calls it for `<id>.rcv`: the handle for `<id>.rcv` (0: `write` was called with the frames) or a
+    // negative errno (EPIPE: closed; EBUSY: a receive is pending; EIO: `write` threw, the frames stay queued)
     startRecv(wait, write) {
-      if (inbox.length > 0 || !wait || events === null) { write(take()); return 0; }
+      if (closed !== null) return -EPIPE;
       if (waiting !== null) return -EBUSY;
-      const h = events.external({ onClose: () => { if (waiting !== null && waiting.h === h) waiting = null; } });
+      if (inbox.length > 0 || !wait || events === null) {
+        try { deliver(write); } catch { stats.writeErrors++; return -EIO; }
+        return 0;
+      }
+      const h = events.external({
+        onClose: () => { if (waiting !== null && waiting.h === h) waiting = null; },
+        onCancel: () => { if (waiting !== null && waiting.h === h) waiting = null; },
+      });
       waiting = { h, write };
       stats.parked++;
       return h;
     },
   };
+  return bridge;
+}
+
+// The adapters' part (Node's and the browser's spool.mjs): the module opened `<id>.snd` (kind 'bsend') or `<id>.rcv`
+// ('brecv'). `io`: `read()` the request file (`<id>.out` or `<id>.rq`), `answer(text)` the response file, `writeInbox`
+// and `removeInbox` the frames file `<id>.inb`. Throws only when the answer can't be written.
+export function serveBridgeFile(bridge, kind, { read, answer, writeInbox, removeInbox }) {
+  if (kind === 'bsend') {
+    let ans = 'ok';
+    try { bridge.send(read()); } catch (err) {
+      ans = err instanceof BridgeClosedError ? `closed: ${err.reason}` : `error: ${errText(err)}`;
+    }
+    answer(ans);
+    return;
+  }
+  let wait = false;
+  try { wait = new TextDecoder().decode(read()) === 'wait'; } catch { /* (a poll) */ }
+  const h = bridge.startRecv(wait, (bytes) => {
+    // (no partial inbox for the module to read: it is removed when the write fails)
+    try { writeInbox(bytes); } catch (err) { try { removeInbox(); } catch { /* (gone) */ } throw err; }
+  });
+  answer(String(h));
 }

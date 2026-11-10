@@ -15,7 +15,8 @@
 // - with `bridge` (WasmHost.Bridge, js/common/bridge.mjs): opening `<spool>/<id>.snd` hands the frame of
 //   `<spool>/<id>.out` to the page; opening `<spool>/<id>.rcv` starts a receive ("wasm-bridge 1"): its content is
 //   a julia_io handle that the page's next `bridge.post` completes (or `0`: the frames are in `<id>.inb` already).
-//   Neither suspends the module, and the page's `post` is not a call into it.
+//   Neither suspends the module, and the page's `post` is not a call into it. Both are refused while the module
+//   is suspended (a re-entry: as a request's start, a ReentryError that poisons the instance).
 //
 //   const wasi = new WASI(args, ['WASMHOST_SPOOL=/work/.wasmhost', ...], [stdin, stdout, stderr,
 //                         new PreopenDirectory('/work', new Map())]);
@@ -46,6 +47,7 @@ import { makeShimFs, posix } from './fs.mjs';
 import { perform } from './http.mjs';
 import { decompressFile, errnoOf } from './decompress.mjs';
 import { jspiGap, oneAtATime, notSuspended } from './jspi.mjs';
+import { serveBridgeFile } from '../common/bridge.mjs';
 
 const KINDS = [
   { kind: 'fetch', res: '.res', req: '.req' },
@@ -139,17 +141,18 @@ export function wrapWasi(wasi, { spool, fetchImpl, credentials, wasiImport = was
     fs.write(p.res, encoder.encode(String(h)));
   }
 
-  // the bridge's two files (no suspension). Never throws.
+  // the bridge's two files (no suspension). The guard first: a send or receive while the module is suspended is a
+  // re-entry (the page called into the module again), whose ReentryError propagates into that call and poisons the
+  // instance, as a request's does; else throws only when the answer can't be written.
   function bridged(p) {
-    if (p.kind === 'bsend') {
-      let ans = 'ok';
-      try { bridge.send(new Uint8Array(fs.read(p.req))); } catch (err) { ans = `error: ${String(err?.message ?? err)}`; }
-      fs.write(p.res, encoder.encode(ans));
-    } else {
-      const inb = p.req.slice(0, -'.rq'.length) + '.inb';
-      const wait = decoder.decode(fs.read(p.req)) === 'wait';
-      fs.write(p.res, encoder.encode(String(bridge.startRecv(wait, (bytes) => { fs.write(inb, bytes); }))));
-    }
+    check();
+    const inb = p.req.slice(0, -'.rq'.length) + '.inb';
+    serveBridgeFile(bridge, p.kind, {
+      read: () => new Uint8Array(fs.read(p.req)),
+      answer: (text) => fs.write(p.res, encoder.encode(text)),
+      writeInbox: (bytes) => fs.write(inb, bytes),
+      removeInbox: () => { if (fs.exists(inb)) fs.remove(inb); },
+    });
   }
 
   const path_open = new WebAssembly.Suspending((...args) => {
