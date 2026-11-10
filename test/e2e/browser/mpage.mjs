@@ -4,9 +4,10 @@
 // the module's evaljs-style messages run here. Playwright produces real mouse and keyboard events on the canvas.
 import { WASI, File, OpenFile, PreopenDirectory, ConsoleStdout } from '@bjorn3/browser_wasi_shim';
 import { wrapWasi, makeShimJuliaIOPaths, jspiGap, promisingExports, makeBridge } from '/js/browser/index.mjs';
+import { evalMessage } from '/test/e2e/mdrive.mjs';
 
-window.log = [];     // what the module's evaljs messages printed (JS ...) and its other messages (R ...)
-let commId = null, main = null, bridge = null, jt = null;
+window.log = [];     // what the module's evaljs messages printed (JS ...), its other messages (R ...), stdout (out ...)
+let commId = null, main = null, bridge = null, jt = null, rc, failure = null;
 
 // window.startMakie({ wasm }) -> { jspiGap } | { imports, exports }: instantiate and start `main`, which stays in flight
 // (suspended in julia_io's poll, parked in Bridge.recv) for as long as the page runs
@@ -24,16 +25,7 @@ window.startMakie = async ({ wasm }) => {
   const events = io.makeJuliaIOEvents();
   const paths = makeShimJuliaIOPaths(wasi);
   jt = makeJuliaTask({ events, keepAlive: false, onDeadlock: () => window.log.push('DEADLOCK') });
-  bridge = makeBridge({ events, onMessage: (v) => {
-    if (v.msg_type === '2') {              // Bonito's EvalJavascript
-      const WGL = { pick_closest: (scene, xy, range) => ['1234567890', 2 + xy[0] % 2] };   // (stands in for WGLMakie.js)
-      const out = new Function('console', 'Bonito', 'WGL', 'scene', v.payload.source)({ log: (...a) => window.log.push('JS ' + a.join(' ')) }, {}, WGL, {});
-      if (v.bridge_ask !== undefined) Promise.resolve(out).then((value) => bridge.post({ bridge_reply: v.bridge_ask, value }));
-    } else {
-      if (v.msg_type === 'hello') commId = v.comm;
-      window.log.push('R ' + JSON.stringify(v));
-    }
-  } });
+  bridge = makeBridge({ events, onMessage: (v) => { if (v.msg_type === 'hello') commId = v.comm; evalMessage(v, bridge, window.log); } });
   const host = wrapWasi(wasi, { spool: '/work/.wasmhost', events, bridge });
   const inst = await WebAssembly.instantiate(mod, { wasi_snapshot_preview1: host.wasiImport,
     julia_io: { ...paths.imports, ...events.imports }, ...jt.imports });
@@ -51,8 +43,7 @@ window.startMakie = async ({ wasm }) => {
   c.addEventListener('wheel', (e) => { e.preventDefault(); upd({ scroll: [e.deltaX, e.deltaY] }); }, { passive: false });
   c.addEventListener('keydown', (e) => upd({ keydown: [e.code, e.key] }));
   c.addEventListener('keyup', (e) => upd({ keyup: e.code }));
-  main = exports.main();
-  main.catch((e) => window.log.push('main rejected ' + e));
+  main = exports.main().then((v) => { rc = v; }, (e) => { failure = String(e?.stack ?? e); });
   return out;
 };
 
@@ -62,6 +53,6 @@ window.bridgeState = () => ({ commId, parked: bridge?.parked(), stats: bridge?.s
 // window.finishMakie() -> the result of `main`, after the page tells the module to stop
 window.finishMakie = async () => {
   bridge.post({ msg_type: 'stop' });
-  const rc = await main;
-  return { rc, stats: bridge.stats, jt: jt.stats?.() };
+  await main;
+  return { rc, failure, stats: bridge.stats, jt: jt.stats?.() };
 };

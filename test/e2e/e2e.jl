@@ -1,7 +1,7 @@
 # End-to-end checks: compile a program with WasmCodegen, run it in Node, Bun or a headless Chromium with WasmHost's
 # adapter, and compare it with native.
 #
-#   julia test/e2e/e2e.jl /path/to/WasmCodegen.jl [spool|import|decompress|concurrent|batch|all] [spool|import]
+#   julia test/e2e/e2e.jl /path/to/WasmCodegen.jl [spool|import|decompress|concurrent|batch|bridge|makie|all] [spool|import]
 #
 # - spool, import: test/e2e/prog.jl (plain Downloads calls) against a local HTTP server
 #   (server.mjs). Its output and downloaded bytes must equal the same program run natively
@@ -20,6 +20,17 @@
 # - batch: test/e2e/bprog.jl, WasmHost.Downloads.request_all in a program of one task (`tasks = :none`, `verify =
 #   :error`): the host's batch. As concurrent (Node: the spool transport in both of its modes).
 #   The third argument of concurrent and batch is the transport (spool, the default, or import).
+# - bridge: test/e2e/brprog.jl, WasmHost.Bridge in a program with Julia tasks (`tasks = :jspi`, `verify = :error`), one
+#   run per case of the page's side, bdrive.mjs (brun.mjs in Node, browser/brun.mjs in Chromium), which checks what the
+#   module sent, printed and returned: main (the codec's values, events in order, the page's queue overflowing,
+#   concurrent asks answered out of order, an ask the page fails), page-close, serve-fails, module-close (the
+#   lifecycle: pending asks and a parked recv end with a BridgeClosedError), write-fails (the frames stay queued) and,
+#   in Chromium, reentry (direct calls while main is suspended: refused by the guard, the instance poisoned). Node or
+#   Chromium (the drivers use node:wasi and Playwright).
+# - makie (not in `all`, not in CI): test/e2e/mprog.jl, a Makie scene's events through WGLMakie's own handler of
+#   `comm` (mrun.mjs in Node, browser/mrun.mjs in Chromium: checked by mdrive.mjs's checkMakie). Needs E2E_MAKIE_ENV,
+#   a Julia project with Makie and WGLMakie with test/e2e/patches/0001-WGLMakie-typed-window-events.patch, WasmCompat
+#   (feat/observables-ext), WasmCodegen and this WasmHost (docs/bridge.md); without it the part is skipped.
 #
 # - WASM_RUNTIME=chromium: the browser adapter (js/browser/) in Playwright's headless Chromium, driven by Node
 #   (test/e2e/browser/: `npm ci` and `npx playwright install chromium` there first). spool and import as above, with
@@ -175,6 +186,46 @@ function reentry(wasm, mode)
     return good
 end
 
+# the bridge: brprog.jl's module, each case of bdrive.mjs (checked there: "BRIDGE PASS")
+function bridge(env)
+    if runtime == "bun"
+        skipped("SKIP: the bridge's drivers run in Node or Chromium (node:wasi, Playwright)\n", "bridge")
+        return true
+    end
+    wasm = joinpath(work, "bridge.wasm")
+    get(ENV, "E2E_REUSE", "") == "1" && isfile(wasm) ||
+        run(`$julia --startup-file=no --project=$env $(joinpath(HERE, "build_bridge.jl")) $wasm`)
+    ok = true
+    for case in ["main", "page-close", "serve-fails", "module-close", "write-fails", (BROWSER ? ["reentry"] : [])...]
+        out = BROWSER ? output(`$node $(joinpath(HERE, "browser", "brun.mjs")) $wasm $wcg $case`) :
+                        output(`$node $NODE_FLAGS $(joinpath(HERE, "brun.mjs")) $wasm $(joinpath(work, "bridge-$case")) $wcg $case`)
+        skipped(out, "bridge/$case") && continue
+        good = occursin(r"^BRIDGE PASS$"m, out)
+        println("== bridge/$case: ", good ? "PASS" : "FAIL", "\n", out)
+        ok &= good
+    end
+    return ok
+end
+
+# (opt-in) mprog.jl with Makie, in the project E2E_MAKIE_ENV (checked by mdrive.mjs: "MAKIE PASS")
+function makie()
+    menv = get(ENV, "E2E_MAKIE_ENV", "")
+    if isempty(menv) || runtime == "bun"
+        skipped(string("SKIP: ", runtime == "bun" ? "the Makie drivers run in Node or Chromium" :
+                       "E2E_MAKIE_ENV is not set (a project with the patched Makie and WGLMakie: docs/bridge.md)", "\n"), "makie")
+        return true
+    end
+    wasm = joinpath(work, "makie.wasm")
+    get(ENV, "E2E_REUSE", "") == "1" && isfile(wasm) ||
+        run(`$julia --startup-file=no --project=$menv $(joinpath(HERE, "build_makie.jl")) $wasm`)
+    out = BROWSER ? output(`$node $(joinpath(HERE, "browser", "mrun.mjs")) $wasm $wcg`) :
+                    output(`$node $NODE_FLAGS $(joinpath(HERE, "mrun.mjs")) $wasm $(joinpath(work, "makie")) $wcg`)
+    skipped(out, "makie") && return true
+    good = occursin(r"^MAKIE PASS$"m, out)
+    println("== makie: ", good ? "PASS" : "FAIL", "\n", out)
+    return good
+end
+
 # the compressed artifact, both encodings of the Pkg server
 function artifacts()
     dir = mkpath(get(ENV, "E2E_ARTIFACTS", joinpath(work, "artifacts")))
@@ -296,11 +347,13 @@ function decompression(env)
     return ok
 end
 
-# (the browser's decompress part compiles nothing)
-env = BROWSER && which == "decompress" ? nothing : setup_env(joinpath(work, "env"))
+# (the browser's decompress part compiles nothing; makie has its own environment)
+env = (BROWSER && which == "decompress") || which == "makie" ? nothing : setup_env(joinpath(work, "env"))
 ok = true
-for part in (which == "all" ? ["spool", "import", "decompress", "concurrent", "batch"] : [which])
+for part in (which == "all" ? ["spool", "import", "decompress", "concurrent", "batch", "bridge"] : [which])
     global ok &= part == "decompress" ? decompression(env) :
+                 part == "bridge" ? bridge(env) :
+                 part == "makie" ? makie() :
                  part in ("concurrent", "batch") ? (which == "all" ? all(t -> concurrency(env, part, t), ("spool", "import")) :
                                                     concurrency(env, part, get(ARGS, 3, "spool"))) :
                  downloads(env, part)

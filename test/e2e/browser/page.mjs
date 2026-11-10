@@ -3,7 +3,8 @@
 // the adapter's decompression.
 import { WASI, File, OpenFile, Directory, PreopenDirectory, ConsoleStdout } from '@bjorn3/browser_wasi_shim';
 import { wrapWasi, makeImports, decompressFile, hasFormat, makeShimFs, makeShimJuliaIOPaths, jspiGap, promisingExports,
-         isPoisoned, ReentryError, InstancePoisonedError, oneAtATime, notSuspended } from '/js/browser/index.mjs';
+         isPoisoned, ReentryError, InstancePoisonedError, oneAtATime, notSuspended, makeBridge } from '/js/browser/index.mjs';
+import { bridgeScenario } from '/test/e2e/bdrive.mjs';
 
 const hex = (b) => [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, '0')).join('');
 const sha256 = async (b) => hex(await crypto.subtle.digest('SHA-256', b));
@@ -286,5 +287,45 @@ window.checkTaskGuard = async () => {
           ['a suspending job while it is suspended in poll: ReentryError, poisoned', jobWhilePolling],
           ['a start while a suspending job is in flight: ReentryError, poisoned', startWhileJob],
           ['that job rejects with an InstancePoisonedError', firstErr instanceof InstancePoisonedError]];
+};
+
+// window.runBridge({ wasm, which }) -> { jspiGap } | { checks, stdout, stderr, stats, imports }: brprog.jl's module
+// (Julia tasks, on WasmCodegen's julia_io events and julia_task from /wcg/js/) with the browser adapter's bridge, and
+// the page's side of the case `which` (../bdrive.mjs). reentry: `poke` and `poke_recv` called directly
+// (WebAssembly.promising on the raw exports) while main is suspended.
+window.runBridge = async ({ wasm, which }) => {
+  const out = { stdout: [], stderr: [], jspiGap: jspiGap() };
+  if (out.jspiGap) return out;
+  const mod = await WebAssembly.compileStreaming(fetch(wasm));
+  out.imports = [...new Set(WebAssembly.Module.imports(mod).map((i) => i.module))];
+  const io = await import('/wcg/js/julia_io.mjs');
+  const { makeJuliaTask } = await import('/wcg/js/julia_task.mjs');
+  const root = new PreopenDirectory('/work', new Map());
+  const wasi = new WASI(['brprog'], ['PWD=/work', 'WASMHOST_SPOOL=/work/.wasmhost', `BRIDGE_CASE=${which}`], [
+    new OpenFile(new File([])),
+    ConsoleStdout.lineBuffered((l) => out.stdout.push(l)),
+    ConsoleStdout.lineBuffered((l) => out.stderr.push(l)),
+    root], { debug: false });
+  const events = io.makeJuliaIOEvents();
+  const paths = makeShimJuliaIOPaths(wasi);
+  const jt = makeJuliaTask({ events, keepAlive: false, onDeadlock: () => out.stderr.push('DEADLOCK') });
+  const s = bridgeScenario(makeBridge, events, which);
+  const host = wrapWasi(wasi, { spool: '/work/.wasmhost', events, bridge: s.bridge });
+  const inst = await WebAssembly.instantiate(mod, { wasi_snapshot_preview1: host.wasiImport,
+    julia_io: { ...paths.imports, ...events.imports }, ...jt.imports });
+  host.bindMemory(inst.exports.memory); events.bindMemory(inst.exports.memory); paths.bindMemory(inst.exports.memory);
+  wasi.initialize(inst); jt.bind(inst);
+  const exports = promisingExports(inst, { tasks: jt });
+  const raw = {
+    poke: () => WebAssembly.promising(inst.exports.poke)(),
+    poke_recv: () => WebAssembly.promising(inst.exports.poke_recv)(),
+    isPoisoned: () => isPoisoned(inst),
+    again: () => exports.main(),
+  };
+  out.checks = await s.run({ main: exports.main(), stdout: () => out.stdout, raw });
+  out.stats = s.bridge.stats;
+  out.spoolLeft = root.dir.contents.get('.wasmhost')?.contents.size ?? -1;
+  jt.shutdown();
+  return out;
 };
 window.ready = true;

@@ -85,6 +85,10 @@ await exports.main();
   error), which a module built with `host_extensions = [:julia_io]` imports; WasmCodegen's own are Node's.
 - `makeShimFs(wasi)` is the adapter's view of the shim's preopens (read and write a file by
   guest path), for a page that puts inputs in or takes results out.
+- `wrapWasi(wasi, { ..., events, bridge })` with a `makeBridge(...)` (WasmHost.Bridge,
+  `../common/bridge.mjs`): messages between the module and the page after it has started; the
+  page's `bridge.post` completes a handle the module waits for, never a call into it. See
+  [`docs/bridge.md`](../../docs/bridge.md).
 
 ## Requirements and limits
 
@@ -100,8 +104,8 @@ await exports.main();
   the module only through `promisingExports(instance)`, which keeps to this (queueing or
   rejecting). A page that calls `instance.exports` directly in the meantime runs Julia code
   re-entrantly, which nothing can make safe; the adapter catches it at the latest when that call
-  needs the host (a download, a decompression, or a request a task starts while the module is
-  suspended).
+  needs the host (a download, a decompression, a request a task starts, or a bridge send or
+  receive, while the module is suspended).
 - **A re-entrant call poisons the instance:** at that point the adapter throws a `ReentryError`
   into the re-entrant call, but cannot unwind it safely: WasmCodegen's handlers catch only
   Julia's own exceptions, so a foreign JavaScript exception passes through the module's frames
@@ -163,6 +167,11 @@ WASM_RUNTIME=chromium julia test/e2e/e2e.jl /path/to/WasmCodegen.jl all
   `InstancePoisonedError` (neither returns a result, the queued one never runs), and so must
   every call after. The queue is checked with a hand-assembled module too: an export that traps
   while executing lets the call queued behind it run (`whenBusy: 'queue'`).
+- **bridge:** `test/e2e/brprog.jl` (WasmHost.Bridge, Julia tasks) in Chromium
+  (`browser/brun.mjs`, the page's side `../bdrive.mjs`): each case asserted, the lifecycle's
+  and the re-entry case's included (`poke` and `poke_recv` called directly while `main` is
+  suspended: a `ReentryError`, then an `InstancePoisonedError`, and `main` rejects with one).
+  See [`docs/bridge.md`](../../docs/bridge.md#tests).
 - **decompress:** `browser/decompress.mjs`, the adapter alone in Chromium: gzip, deflate and
   zstd made by `node:zlib` must decompress to the original bytes (or zstd `ENOSYS`), and the
   error cases must give WasmHost.Decompress's errnos. (`test/e2e/dprog.jl` needs WasmCodegen's

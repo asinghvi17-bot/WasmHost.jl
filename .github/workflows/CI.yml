@@ -58,6 +58,11 @@ jobs:
             runtime: node
           - part: batch
             runtime: node
+          # (WasmHost.Bridge: brprog.jl's cases, Node's adapter and the browser's)
+          - part: bridge
+            runtime: node
+          - part: bridge
+            runtime: chromium
     env:
       WASM_RUNTIME: ${{ matrix.runtime }}
       # (a run skipped for an engine gap fails the job: none is documented for Node 24 or Bun 1.4)
