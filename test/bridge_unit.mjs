@@ -217,3 +217,24 @@ const tick = () => new Promise((r) => setTimeout(r, 0));
   check('an empty blob at the end of a frame without a blob region', v instanceof Float32Array && v.length === 0);
   check('a non-empty blob out of range still throws', errName(() => { const h = new TextEncoder().encode('{"$b":[0,4,"f32"]}'); const f = new Uint8Array(4 + h.length); new DataView(f.buffer).setUint32(0, h.length, true); f.set(h, 4); decodeFrame(f); }) === 'Error');
 }
+
+// raw replies through post (the re-review of a9d3ee5: a raw post answered the ask without the books, so a later
+// reply to the finished id was taken, exempt: 5 sequential asks queued 5 exempt frames with capacity 1)
+{
+  const b = makeBridge({ events, capacity: 1 });
+  let raw = 0, late = 0, taken = [];
+  for (let id = 1; id <= 5; id++) {
+    b.send(encodeFrame({ bridge_ask: id }));
+    // the page answers with a raw post; refused, it answers through reply (the books)
+    if (errName(() => b.post({ bridge_reply: id, value: id })) === 'Error') { raw++; b.reply(id, id); }
+    await tick();
+    b.startRecv(true, (bytes) => { taken.push(...frames(bytes)); });   // the module takes it: the ask is finished
+    if (b.reply(id, -id)) late++;          // a stale reply after the ask finished
+  }
+  await tick();
+  check('post of a bridge_reply object throws (use reply)', raw === 5);
+  check('sequential asks: each answered once, in order', JSON.stringify(taken.map((m) => m.value)) === '[1,2,3,4,5]');
+  await tick();
+  check('sequential asks: no stale reply taken, nothing left queued (capacity 1)', late === 0 && b.pending() === 0 && b.stats.strayReplies === 5);
+  check('post of an array, or of an object holding a reply deeper: an ordinary post', errName(() => b.post([{ bridge_reply: 1 }])) === null && b.pending() === 1);
+}

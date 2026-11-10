@@ -211,8 +211,14 @@ export function makeBridge({ events = null, onMessage = () => {}, onAsk = null, 
   const bridge = {
     stats,
     // page -> module: queue `value`; a pending recv of the module is completed. Throws a BridgeClosedError once
-    // closed, a BridgeFullError when it does not fit (overflow 'reject')
-    post(value) { enqueue(encodeFrame(value), false); },
+    // closed, a BridgeFullError when it does not fit (overflow 'reject'), and an Error for an answer to an ask (an
+    // object with `bridge_reply`, which the module would take as one): answers go through `reply`, which keeps
+    // the outstanding asks' books
+    post(value) {
+      if (value !== null && typeof value === 'object' && !Array.isArray(value) && Object.hasOwn(value, 'bridge_reply'))
+        throw new Error('wasmhost bridge: post of a bridge_reply object: answer an ask with bridge.reply(id, answer)');
+      enqueue(encodeFrame(value), false);
+    },
     // the answer to the module's `Bridge.ask` of id `id`: a value, or a promise of one; a rejection is the ask's
     // error. `true` when it is taken; `false` (nothing queued, stats.strayReplies) for an id the module did not ask,
     // or asked and has been answered (the first reply is the answer), or on a closed bridge

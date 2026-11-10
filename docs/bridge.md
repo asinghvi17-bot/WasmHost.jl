@@ -148,8 +148,8 @@ frames and `maxBytes` bytes. When it is full:
 A frame larger than `maxBytes` always throws. The answer to each of the module's asks is always
 queued and never dropped, and it doesn't count towards the limits: the bridge exempts one reply
 per outstanding ask, so the module's asks bound them. A second reply, or one to an id that wasn't
-asked, is refused (`reply` returns `false`). A raw `post` of a `bridge_reply` object is an
-ordinary post, counted and limited like any other. An answer
+asked, is refused (`reply` returns `false`). `post` of a `bridge_reply` object throws: an answer
+goes only through `reply`, so a stale or duplicate one can't reach the module. An answer
 larger than `maxBytes`, or one that can't be encoded, becomes the ask's error answer. A `post` of
 something that isn't JSON (`undefined`, a function) throws. One receive takes at most `chunkBytes` of frames (at least one frame),
 so the module never reads one huge inbox. The rest is there at once for its next receive. After
