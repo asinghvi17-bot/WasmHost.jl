@@ -443,7 +443,13 @@ function parse_string!(p::Parser)::String
                 if u >= 0xd800 && u < 0xdc00 && p.i + 1 <= length(p.bytes) && p.bytes[p.i] == UInt8('\\') && p.bytes[p.i+1] == UInt8('u')
                     p.i += 2
                     lo = parse_hex4!(p)
-                    u = 0x10000 + ((u - 0xd800) << 10) + (lo - 0xdc00)
+                    if lo >= 0xdc00 && lo < 0xe000
+                        u = 0x10000 + ((u - 0xd800) << 10) + (lo - 0xdc00)
+                    else
+                        # (a high surrogate alone: U+FFFD, and the escape after it is its own character)
+                        write(out, '\ufffd')
+                        u = lo
+                    end
                 end
                 write(out, Char(u))
             else
@@ -522,6 +528,7 @@ function parse_value!(p::Parser)::Any
         p.i += 1
         d = Dict{String,Any}()
         skip_ws!(p)
+        p.i <= length(p.bytes) || parse_error(p, "unterminated object")
         if p.bytes[p.i] == UInt8('}')
             p.i += 1
             return d
@@ -551,6 +558,7 @@ function parse_value!(p::Parser)::Any
         p.i += 1
         v = Any[]
         skip_ws!(p)
+        p.i <= length(p.bytes) || parse_error(p, "unterminated array")
         if p.bytes[p.i] == UInt8(']')
             p.i += 1
             return v
@@ -609,24 +617,32 @@ const EPIPE = Int32(64)
 # the message of a parked receive's handle when the page closed the bridge (js/common/bridge.mjs)
 const CLOSED_PREFIX = "wasm-bridge closed: "
 
-# the bridge's state in the module: closed (and why), and the handle of a `recv` parked for the page (0: none)
+# the bridge's state in the module: closed (and why), a `recv` under way, and the handle of one parked for the page
+# (0: none)
 mutable struct State
     closed::Bool
     reason::String
+    receiving::Bool
     parked::Int32
 end
-const STATE = State(false, "", Int32(0))
+const STATE = State(false, "", false, Int32(0))
 
-"The host's handle of a started `recv` (`0`: the frames are there already), a negated errno, or `nothing` (no adapter bridge)."
-function start_recv(base::String, wait::Bool)::Union{Nothing,Int32}
+"""
+The host's answer to a started `recv`: its handle (`0`: the frames are there already) or a negated errno, and the
+answer's second line (EPIPE: why the bridge closed); `nothing` when no adapter bridge answered.
+"""
+function start_recv(base::String, wait::Bool)::Union{Nothing,Tuple{Int32,String}}
     write(base * ".rq", wait ? "wait" : "poll")
-    h = nothing
+    text = ""
     try
-        h = tryparse(Int32, strip(read(base * ".rcv", String)))
+        text = read(base * ".rcv", String)
     catch
-        h = nothing
+        return nothing
     end
-    return h
+    nl = findfirst(==('\n'), text)
+    h = tryparse(Int32, strip(nl === nothing ? text : text[1:prevind(text, nl)]))
+    h === nothing && return nothing
+    return (h, nl === nothing ? "" : String(text[nextind(text, nl):end]))
 end
 
 "Wait, as a task, until the `julia_io` handle is ready (WasmCodegen's `Runtime.Host.await_handle`)."
@@ -737,19 +753,31 @@ end
 # the frames, or nothing when the bridge is closed
 function receive(wait::Bool)::Union{Nothing,Vector{Vector{UInt8}}}
     STATE.closed && return nothing
+    # (one at a time: refused here too, for the moment between the page's answer to one and its task's resuming)
+    STATE.receiving && throw(BridgeError("another task is receiving already (one recv at a time: the task of Bridge.serve)"))
+    STATE.receiving = true
+    try
+        return receive_one(wait)
+    finally
+        STATE.receiving = false
+    end
+end
+
+function receive_one(wait::Bool)::Union{Nothing,Vector{Vector{UInt8}}}
     isempty(spool_dir()) && throw(BridgeError("no spool directory (the host gave none)"))
     base = spool_path("")
-    h = start_recv(base, wait)
-    if h === nothing || h < 0
+    answer = start_recv(base, wait)
+    h = answer === nothing ? Int32(0) : answer[1]
+    if answer === nothing || h < 0
         rm(base * ".rq"; force = true)
         rm(base * ".rcv"; force = true)
-        h === nothing && throw(BridgeError("the host adapter has no bridge"))
+        answer === nothing && throw(BridgeError("the host adapter has no bridge"))
         if h == -EPIPE
-            mark_closed!("closed by the page")
+            mark_closed!(isempty(answer[2]) ? "closed by the page" : answer[2])
             return nothing
         end
         h == -EBUSY && throw(BridgeError("another task is receiving already (one recv at a time: the task of Bridge.serve)"))
-        h == -EIO && throw(BridgeError("the host could not write the page's messages (they stay queued)"))
+        h == -EIO && throw(BridgeError("the host could not write the page's messages (they stay queued on the page)"))
         throw(BridgeError(string("the host can't receive now (errno ", -h, ")")))
     end
     try
@@ -769,7 +797,7 @@ function receive(wait::Bool)::Union{Nothing,Vector{Vector{UInt8}}}
                     mark_closed!(String(chopprefix(msg, CLOSED_PREFIX)))
                     return nothing
                 end
-                throw(BridgeError(string("the host could not deliver the page's messages (they stay queued): ", msg)))
+                throw(BridgeError(string("the host could not deliver the page's messages (they stay queued on the page): ", msg)))
             end
         end
         frames = split_frames(read(base * ".inb"))

@@ -9,7 +9,7 @@
 # - module-close: `Bridge.close` from main while serve is parked: serve returns, the page is told, an ask after fails.
 # - write-fails: the page's first write of the frames throws: the first recv fails, the frames stay queued, the
 #   second recv gets them.
-# - reentry (a browser): as main up to the pings; the page calls `poke` and `poke_recv` directly while main is
+# - reentry (a browser): as main up to the pings; the page calls `poke_recv` and `poke` directly while main is
 #   suspended, which the adapter's guard refuses (ReentryError, then InstancePoisonedError).
 #
 # What the module can't send any more (after the close) it prints, "R ..." lines on stdout.
@@ -169,7 +169,9 @@ function poke()::Int32
     B.send(Dict{String,Any}("type" => "poke"))
     return Int32(0)
 end
+# (the host's receive itself: `recv` would refuse in Julia, as serve's task is receiving)
 function poke_recv()::Int32
-    return Int32(length(B.recv(; wait = false)))
+    a = B.start_recv(WasmHost.spool_path(""), false)
+    return a === nothing ? Int32(-1) : a[1]
 end
 end

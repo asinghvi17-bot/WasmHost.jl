@@ -144,3 +144,31 @@ const tick = () => new Promise((r) => setTimeout(r, 0));
   serveBridgeFile(b, 'bsend', io(encodeFrame({ x: 1 })));
   check('bsend on a closed bridge: closed: reason', files.res === 'closed: done');
 }
+
+// the review of the fixes: replies are never dropped (drop-oldest) nor too large to queue; posts of non-JSON throw;
+// a closed bridge's receive answer carries the page's reason
+{
+  const d = makeBridge({ events, capacity: 2, overflow: 'drop-oldest' });
+  d.reply(1, 'picked');
+  await tick();
+  for (let i = 0; i < 5; i++) d.post({ i });
+  let got = null;
+  d.startRecv(true, (bytes) => { got = frames(bytes); });
+  check('drop-oldest: a queued reply is not dropped, and does not count', JSON.stringify(got) === '[{"bridge_reply":1,"value":"picked"},{"i":3},{"i":4}]');
+  const m = makeBridge({ events, maxBytes: 64 });
+  const unhandled = [];
+  const onRej = (e) => unhandled.push(e);
+  process.on('unhandledRejection', onRej);
+  m.reply(2, 'x'.repeat(200));
+  await tick(); await tick();
+  process.off('unhandledRejection', onRej);
+  let ans = null;
+  m.startRecv(true, (bytes) => { ans = frames(bytes); });
+  check('a reply larger than the queue: an error answer, no unhandled rejection', unhandled.length === 0 && ans?.[0]?.bridge_reply === 2 && /larger than the queue/.test(ans[0].error));
+  const b = makeBridge({ events });
+  check('post(undefined), post(a function): throw, nothing queued', errName(() => b.post(undefined)) === 'Error' && errName(() => b.post(() => 1)) === 'Error' && b.pending() === 0);
+  b.close('page gone');
+  const files = {};
+  serveBridgeFile(b, 'brecv', { read: () => new TextEncoder().encode('wait'), answer: (t) => { files.res = t; }, writeInbox: () => {}, removeInbox: () => {} });
+  check('brecv on a closed bridge: -EPIPE and the reason', files.res === '-64\npage gone');
+}

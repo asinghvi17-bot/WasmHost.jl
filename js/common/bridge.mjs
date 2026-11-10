@@ -17,7 +17,8 @@
 //   flight (which the module waits for as for a timer), or waits in the queue for the next `recv`.
 // - Frames leave the queue only once they are written: a `write` that throws leaves them queued, and the module's
 //   receive fails (`startRecv` answers -EIO; a parked receive's handle is made ready with the error as its message
-//   and no `<id>.inb`): no receive is stranded, no frame is lost.
+//   and no `<id>.inb`): no receive is stranded, and the next receive gets the frames (unless the module gives up:
+//   `Bridge.serve` fails on it and closes the bridge, which drops them).
 // - The queue is bounded (`capacity` frames, `maxBytes` bytes). When it is full, `overflow: 'reject'` (the default)
 //   makes `post` throw a BridgeFullError and queue nothing (the page's backpressure: `room()` says how much fits);
 //   `'drop-oldest'` drops the oldest frames to make room (for events that only matter as the latest state). Replies
@@ -42,7 +43,7 @@ const BLOB_KEY = '$b';
 export function encodeFrame(value) {
   const blobs = [];
   let size = 0;
-  const header = new TextEncoder().encode(JSON.stringify(value, function (k, v) {
+  const json = JSON.stringify(value, function (k, v) {
     if (ArrayBuffer.isView(v) && !(v instanceof DataView)) {
       const tag = tagOf(v);
       if (tag === null) throw new Error(`wasmhost bridge: can't encode a ${v.constructor.name}`);
@@ -55,7 +56,10 @@ export function encodeFrame(value) {
     }
     if (typeof v === 'bigint') return Number(v);
     return v;
-  }));
+  });
+  // (undefined, a function, a symbol: no JSON, which the module could not decode)
+  if (json === undefined) throw new Error(`wasmhost bridge: can't encode ${typeof value === 'symbol' ? 'a symbol' : String(value)}: not a JSON value`);
+  const header = new TextEncoder().encode(json);
   const start = 4 + header.length;
   const blobStart = start + ((8 - (start % 8)) % 8);
   const out = new Uint8Array(blobs.length ? blobStart + size : start);
@@ -110,28 +114,44 @@ export function makeBridge({ events = null, onMessage = () => {}, onAsk = null, 
   if (overflow !== 'reject' && overflow !== 'drop-oldest') throw new Error(`wasmhost bridge: overflow ${overflow}: 'reject' or 'drop-oldest'`);
   if (!(capacity >= 1 && maxBytes >= 1 && chunkBytes >= 1)) throw new Error('wasmhost bridge: capacity, maxBytes and chunkBytes must be positive');
   const inbox = [];            // frames (Uint8Array) the page posted, not yet taken by the module
-  let queued = 0;              // their bytes
+  const replies = new WeakSet(); // those of them that answer the module's asks: never dropped, not counted
+  let queued = 0;              // the bytes of the others (what capacity and maxBytes bound)
+  let counted = 0;             // their number
+  let total = 0;               // the bytes of all
   let waiting = null;          // { h, write } of a pending recv
   let closed = null;           // why the bridge closed, once it has
   // (posted: frames queued; sent: frames of the module; delivered: frames taken by the module, in `receives` writes;
   // parked: receives that waited; dropped, refused: frames of a full queue (overflow), or dropped by a close)
   const stats = { posted: 0, sent: 0, delivered: 0, receives: 0, parked: 0, dropped: 0, refused: 0, writeErrors: 0 };
 
-  function enqueue(frame, isReply) {
+  function enqueue(frame, isReply, anySize = false) {
     if (closed !== null) throw new BridgeClosedError(closed);
-    if (frame.length > maxBytes) { stats.refused++; throw new BridgeFullError(`wasmhost bridge: a frame of ${frame.length} bytes is larger than the queue (maxBytes ${maxBytes})`); }
-    if (!isReply) {
-      const full = () => inbox.length >= capacity || queued + frame.length > maxBytes;
+    if (frame.length > maxBytes && !anySize) { stats.refused++; throw new BridgeFullError(`wasmhost bridge: a frame of ${frame.length} bytes is larger than the queue (maxBytes ${maxBytes})`); }
+    if (isReply) replies.add(frame);
+    else {
+      const full = () => counted >= capacity || queued + frame.length > maxBytes;
       if (full() && overflow === 'reject') {
         stats.refused++;
-        throw new BridgeFullError(`wasmhost bridge: the queue is full (${inbox.length} frames, ${queued} bytes; capacity ${capacity}, maxBytes ${maxBytes})`);
+        throw new BridgeFullError(`wasmhost bridge: the queue is full (${counted} frames, ${queued} bytes; capacity ${capacity}, maxBytes ${maxBytes})`);
       }
-      while (full() && inbox.length > 0) { queued -= inbox.shift().length; stats.dropped++; }
+      // (drop-oldest: the oldest frames that are not replies)
+      for (let k = 0; full() && k < inbox.length;) {
+        if (replies.has(inbox[k])) { k++; continue; }
+        const [f] = inbox.splice(k, 1);
+        unqueue(f);
+        stats.dropped++;
+      }
+      counted++;
+      queued += frame.length;
     }
     inbox.push(frame);
-    queued += frame.length;
+    total += frame.length;
     stats.posted++;
     wake();
+  }
+  function unqueue(f) {
+    total -= f.length;
+    if (!replies.has(f)) { counted--; queued -= f.length; }
   }
   // write the next chunk of frames (`u32le length | frame`, repeated; at most chunkBytes, at least one frame), and
   // take them off the queue once `write` returned (it may throw: they stay queued)
@@ -143,7 +163,7 @@ export function makeBridge({ events = null, onMessage = () => {}, onAsk = null, 
     let at = 0;
     for (let k = 0; k < n; k++) { const f = inbox[k]; dv.setUint32(at, f.length, true); out.set(f, at + 4); at += 4 + f.length; }
     write(out);
-    for (let k = 0; k < n; k++) queued -= inbox[k].length;
+    for (let k = 0; k < n; k++) unqueue(inbox[k]);
     inbox.splice(0, n);
     stats.delivered += n;
     stats.receives++;
@@ -165,16 +185,20 @@ export function makeBridge({ events = null, onMessage = () => {}, onAsk = null, 
     closed = String(reason);
     stats.dropped += inbox.length;
     inbox.length = 0;
-    queued = 0;
+    queued = counted = total = 0;
     if (waiting !== null) { const w = waiting; waiting = null; events.ready(w.h, CLOSED_PREFIX + closed); }
     try { onClose(closed, by); } catch { /* (the page's callback: not the module's error) */ }
     return true;
   }
   function postReply(id, result) {
     if (closed !== null) return;   // (the module gave up its asks when it closed)
+    // (an answer that can't be encoded, or is larger than the queue, is the ask's error: the ask must end)
+    const failed = (why) => encodeFrame({ bridge_reply: id, error: why });
     let frame;
-    try { frame = encodeFrame(result); } catch (err) { frame = encodeFrame({ bridge_reply: id, error: `the answer can't be encoded: ${errText(err)}` }); }
-    enqueue(frame, true);
+    try { frame = encodeFrame(result); } catch (err) { frame = failed(`the answer can't be encoded: ${errText(err)}`); }
+    // (the error answer is queued whatever its size: small, and the ask must end)
+    if (frame.length > maxBytes) frame = failed(`the answer (${frame.length} bytes) is larger than the queue (maxBytes ${maxBytes})`);
+    enqueue(frame, true, true);
   }
   const bridge = {
     stats,
@@ -188,9 +212,9 @@ export function makeBridge({ events = null, onMessage = () => {}, onAsk = null, 
     },
     // frames waiting for the module, and their bytes
     pending: () => inbox.length,
-    pendingBytes: () => queued,
+    pendingBytes: () => total,
     // what a post may still queue without overflowing
-    room: () => ({ frames: Math.max(0, capacity - inbox.length), bytes: Math.max(0, maxBytes - queued) }),
+    room: () => ({ frames: Math.max(0, capacity - counted), bytes: Math.max(0, maxBytes - queued) }),
     // whether the module is parked in recv
     parked: () => waiting !== null,
     // why it closed, or null while open
@@ -249,5 +273,6 @@ export function serveBridgeFile(bridge, kind, { read, answer, writeInbox, remove
     // (no partial inbox for the module to read: it is removed when the write fails)
     try { writeInbox(bytes); } catch (err) { try { removeInbox(); } catch { /* (gone) */ } throw err; }
   });
-  answer(String(h));
+  // (a closed bridge: the reason on a line of its own)
+  answer(h === -EPIPE ? `${h}\n${bridge.closed()}` : String(h));
 }

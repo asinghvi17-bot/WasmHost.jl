@@ -73,11 +73,11 @@ export function bridgeScenario(makeBridge, events, which) {
       if (which === 'reentry') {
         // main is suspended (in julia_io's poll, its tasks waiting): a direct call into the module is a re-entry
         await until(() => bridge.parked(), 'a parked recv');
-        const r1 = await raw.poke().then(() => 'returned', errName);
-        check('a direct call that sends: ReentryError', r1 === 'ReentryError');
+        const r1 = await raw.poke_recv().then(() => 'returned', errName);
+        check('a direct call that receives: ReentryError', r1 === 'ReentryError');
         check('the instance is poisoned', raw.isPoisoned());
-        const r2 = await raw.poke_recv().then(() => 'returned', errName);
-        check('a direct call that receives, after: InstancePoisonedError', r2 === 'InstancePoisonedError');
+        const r2 = await raw.poke().then(() => 'returned', errName);
+        check('a direct call that sends, after: InstancePoisonedError', r2 === 'InstancePoisonedError');
         check('the bridge was not used by them', !got.some((m) => m.type === 'poke'));
         bridge.post({ type: 'stop' });
         await Promise.race([settled, wait(20000)]);
@@ -164,7 +164,7 @@ export function bridgeScenario(makeBridge, events, which) {
         bridge.post({ type: 'kept' });
         await settled;
         check('main returned 0', rc === 0 && mainErr === null);
-        check('the first recv failed with the write\'s error', stdout().some((l) => l.startsWith('R first recv: BridgeError: the host could not deliver the page\'s messages (they stay queued): wasm-bridge: the frames could not be written: injected write failure')));
+        check('the first recv failed with the write\'s error', stdout().some((l) => l.startsWith('R first recv: BridgeError: the host could not deliver the page\'s messages (they stay queued on the page): wasm-bridge: the frames could not be written: injected write failure')));
         check('the frame stayed queued: the second recv got it', same(msg('got'), { type: 'got', n: 1, first: 'kept' }));
         check('one write error, nothing left', bridge.stats.writeErrors === 1 && bridge.pending() === 0);
       } else {

@@ -291,7 +291,7 @@ window.checkTaskGuard = async () => {
 
 // window.runBridge({ wasm, which }) -> { jspiGap } | { checks, stdout, stderr, stats, imports }: brprog.jl's module
 // (Julia tasks, on WasmCodegen's julia_io events and julia_task from /wcg/js/) with the browser adapter's bridge, and
-// the page's side of the case `which` (../bdrive.mjs). reentry: `poke` and `poke_recv` called directly
+// the page's side of the case `which` (../bdrive.mjs). reentry: `poke_recv` and `poke` called directly
 // (WebAssembly.promising on the raw exports) while main is suspended.
 window.runBridge = async ({ wasm, which }) => {
   const out = { stdout: [], stderr: [], jspiGap: jspiGap() };

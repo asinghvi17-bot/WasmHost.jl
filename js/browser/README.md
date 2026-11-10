@@ -169,7 +169,7 @@ WASM_RUNTIME=chromium julia test/e2e/e2e.jl /path/to/WasmCodegen.jl all
   while executing lets the call queued behind it run (`whenBusy: 'queue'`).
 - **bridge:** `test/e2e/brprog.jl` (WasmHost.Bridge, Julia tasks) in Chromium
   (`browser/brun.mjs`, the page's side `../bdrive.mjs`): each case asserted, the lifecycle's
-  and the re-entry case's included (`poke` and `poke_recv` called directly while `main` is
+  and the re-entry case's included (`poke_recv` and `poke` called directly while `main` is
   suspended: a `ReentryError`, then an `InstancePoisonedError`, and `main` rejects with one).
   See [`docs/bridge.md`](../../docs/bridge.md#tests).
 - **decompress:** `browser/decompress.mjs`, the adapter alone in Chromium: gzip, deflate and

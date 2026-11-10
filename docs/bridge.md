@@ -67,7 +67,8 @@ the response file makes the adapter do the work, and the open never suspends the
   then reads `<id>.inb`. If there is no `<id>.inb` once the handle is ready, the handle's
   message (`errmsg`) says why: `wasm-bridge closed: <reason>` (the page closed the bridge) or the
   write's error (the frames stay queued).
-- **Errnos of `<id>.rcv`:** `-64` (EPIPE): the bridge is closed. `-10` (EBUSY): another
+- **Errnos of `<id>.rcv`:** `-64` (EPIPE): the bridge is closed, and the answer's second line
+  is the page's reason. `-10` (EBUSY): another
   receive is pending (one at a time). `-29` (EIO): the frames could not be written, and they stay
   queued.
 - **Control members** of a frame's object: `"bridge_ask": id` (a request of `ask`),
@@ -121,7 +122,9 @@ this with `verify = :error`.
 - **`send`** returns `false` when no adapter bridge took the frame. It throws a `BridgeError`
   when the page's `onMessage` threw, and a `BridgeClosedError` when the bridge is closed.
 - **A write that fails** (the adapter could not write `<id>.inb`) leaves the frames queued and
-  fails that receive with a `BridgeError`. No receive is stranded and no frame is lost: the next
+  fails that receive with a `BridgeError`, so no receive is stranded. `serve` treats it as its
+  error: it fails and closes the bridge, which drops the queue. A program that would rather retry
+  receives with `recv` in a loop of its own, and the next
   receive gets them.
 
 ## The page's queue
@@ -135,8 +138,10 @@ frames and `maxBytes` bytes. When it is full:
 - `overflow: 'drop-oldest'`: the oldest frames are dropped to make room (`stats.dropped`). Use
   it for events that only matter as the latest state (mouse moves).
 
-A frame larger than `maxBytes` always throws. Answers to the module's asks are always queued (the
-module's asks bound them). One receive takes at most `chunkBytes` of frames (at least one frame),
+A frame larger than `maxBytes` always throws. Answers to the module's asks are always queued and
+never dropped, and they don't count towards the limits (the module's asks bound them). An answer
+larger than `maxBytes`, or one that can't be encoded, becomes the ask's error answer. A `post` of
+something that isn't JSON (`undefined`, a function) throws. One receive takes at most `chunkBytes` of frames (at least one frame),
 so the module never reads one huge inbox. The rest is there at once for its next receive. After
 a close, nothing is queued and `post` throws.
 
@@ -167,7 +172,7 @@ handlers, the scheduler's task tables).
   It asserts what the module sent, printed and returned, for each case: `main` (the codec's
   values, events in order, the queue overflowing, two asks answered out of order, a failed ask),
   `page-close`, `serve-fails`, `module-close`, `write-fails` and, in Chromium, `reentry` (direct
-  calls of exports that send and receive while main is suspended: ReentryError, then
+  calls of exports that receive and send while main is suspended: ReentryError, then
   InstancePoisonedError, and main rejects).
 - `julia test/e2e/e2e.jl WASMCODEGEN makie` (opt-in, not in CI): see below.
 

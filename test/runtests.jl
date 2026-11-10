@@ -512,6 +512,21 @@ end
                 @test isempty(readdir(dir))
             end
         end
+        # the host's answer to a receive: the handle or errno, and (EPIPE) the page's reason
+        mktempdir() do dir
+            base = joinpath(dir, "1")
+            write(base * ".rcv", "-64\npage gone")
+            @test B.start_recv(base, true) == (Int32(-64), "page gone")
+            write(base * ".rcv", "12")
+            @test B.start_recv(base, true) == (Int32(12), "")
+            write(base * ".rcv", "x")
+            @test B.start_recv(base, true) === nothing
+        end
+        # (JSON escapes: a lone high surrogate is U+FFFD, the escape after it its own character; a truncated header)
+        p = B.Parser(Vector{UInt8}(codeunits("\"\\ud800\\u0041\"")), 1, 0)
+        @test B.parse_string!(p) == "\ufffdA"
+        @test_throws B.BridgeError B.decode(UInt8[1, 0, 0, 0, UInt8('[')])
+        @test_throws B.BridgeError B.decode(UInt8[1, 0, 0, 0, UInt8('{')])
         # an answer to an ask nobody made, a second answer: dropped
         ch = Channel{Any}(1)
         B.PENDING[99] = ch
@@ -564,7 +579,7 @@ end
             @test_skip "$runtime not found"
         else
             out = split(chomp(read(`$node $(joinpath(@__DIR__, "bridge_unit.mjs"))`, String)), '\n')
-            @test length(out) >= 36
+            @test length(out) >= 40
             for l in out
                 @test startswith(l, "ok ")
             end
