@@ -10,12 +10,13 @@ const events = {
 };
 const check = (what, ok) => console.log(`${ok ? 'ok' : 'FAIL'} ${what}`);
 const errName = (f) => { try { f(); return null; } catch (e) { return e instanceof BridgeClosedError ? 'BridgeClosedError' : e instanceof BridgeFullError ? 'BridgeFullError' : e?.name; } };
-// the frames of an inbox write (u32le length | frame, repeated), decoded
-const frames = (bytes) => {
+// the records of an inbox write (u32le length | u8 kind | frame, repeated): [kind, decoded frame]
+const records = (bytes) => {
   const out = [], dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  for (let i = 0; i < bytes.length;) { const n = dv.getUint32(i, true); out.push(decodeFrame(bytes.subarray(i + 4, i + 4 + n))); i += 4 + n; }
+  for (let i = 0; i < bytes.length;) { const n = dv.getUint32(i, true); out.push([bytes[i + 4], decodeFrame(bytes.subarray(i + 5, i + 5 + n))]); i += 5 + n; }
   return out;
 };
+const frames = (bytes) => records(bytes).map(([, v]) => v);
 const tick = () => new Promise((r) => setTimeout(r, 0));
 
 // a parked receive whose write throws (the review's reproduction: the waiter and the frames were lost): the handle is
@@ -218,23 +219,26 @@ const tick = () => new Promise((r) => setTimeout(r, 0));
   check('a non-empty blob out of range still throws', errName(() => { const h = new TextEncoder().encode('{"$b":[0,4,"f32"]}'); const f = new Uint8Array(4 + h.length); new DataView(f.buffer).setUint32(0, h.length, true); f.set(h, 4); decodeFrame(f); }) === 'Error');
 }
 
-// raw replies through post (the re-review of a9d3ee5: a raw post answered the ask without the books, so a later
-// reply to the finished id was taken, exempt: 5 sequential asks queued 5 exempt frames with capacity 1)
+// raw replies through post (the re-reviews of a9d3ee5 and 1b63d20): a posted message is never an answer, however it
+// serializes: only `reply` writes the answers' record kind. Five sequential asks with capacity 1, each 'answered'
+// first by a raw post (a plain object, then Codex's toJSON one), then by reply, then by a stale reply
 {
   const b = makeBridge({ events, capacity: 1 });
-  let raw = 0, late = 0, taken = [];
+  let late = 0;
+  const got = [];
   for (let id = 1; id <= 5; id++) {
     b.send(encodeFrame({ bridge_ask: id }));
-    // the page answers with a raw post; refused, it answers through reply (the books)
-    if (errName(() => b.post({ bridge_reply: id, value: id })) === 'Error') { raw++; b.reply(id, id); }
+    const raw = id % 2 ? { bridge_reply: id, value: -id } : { toJSON() { return { bridge_reply: id, value: -id }; } };
+    const posted = errName(() => b.post(raw)) === null;
+    b.reply(id, id);
     await tick();
-    b.startRecv(true, (bytes) => { taken.push(...frames(bytes)); });   // the module takes it: the ask is finished
-    if (b.reply(id, -id)) late++;          // a stale reply after the ask finished
+    b.startRecv(true, (bytes) => { got.push(...records(bytes)); });   // the module takes both: the ask is answered
+    if (b.reply(id, 100 + id)) late++;      // a stale reply after the answer
+    if (!posted) got.push(['post threw']);
   }
   await tick();
-  check('post of a bridge_reply object throws (use reply)', raw === 5);
-  check('sequential asks: each answered once, in order', JSON.stringify(taken.map((m) => m.value)) === '[1,2,3,4,5]');
-  await tick();
-  check('sequential asks: no stale reply taken, nothing left queued (capacity 1)', late === 0 && b.pending() === 0 && b.stats.strayReplies === 5);
-  check('post of an array, or of an object holding a reply deeper: an ordinary post', errName(() => b.post([{ bridge_reply: 1 }])) === null && b.pending() === 1);
+  const kinds = got.map(([k, v]) => `${k}:${v?.value}`).join(' ');
+  check('raw posts (plain, toJSON) are messages (kind 0), answers are kind 1', kinds === '0:-1 1:1 0:-2 1:2 0:-3 1:3 0:-4 1:4 0:-5 1:5');
+  check('no stale reply taken, nothing left queued (capacity 1)', late === 0 && b.pending() === 0 && b.stats.strayReplies === 5);
+  check('the raw posts were counted (ordinary posts)', b.stats.posted === 10);
 }

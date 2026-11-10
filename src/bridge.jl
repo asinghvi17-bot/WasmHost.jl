@@ -19,8 +19,9 @@ Protocol `wasm-bridge 1`; see `docs/bridge.md` and `js/common/bridge.mjs` for th
   `recv(wait = false)` takes what is there without waiting (no `julia_io` events needed): for
   a program with no task of its own that waits, called at the start of each export.
 - **Requests, [`ask`](@ref):** a task sends a request and parks until the page answers it
-  (`{"bridge_reply": id, "value": v}`, or `"error"`: an [`AskError`](@ref)); [`serve`](@ref)
-  delivers the answers.
+  (`{"bridge_reply": id, "value": v}`, or `"error"`: an [`AskError`](@ref)) with
+  `bridge.reply`, whose answer is an inbox record of its own kind: a receive ([`serve`](@ref)'s)
+  delivers it. A message the page posts is never an answer, whatever its keys.
 - **The end, [`close`](@ref):** the module (`Bridge.close`, or [`serve`](@ref) ending) or the
   page (`bridge.close()`) closes the bridge: a parked `recv` wakes, it and every later `recv`,
   `send` and `ask` throw a [`BridgeClosedError`](@ref), and so do the pending asks.
@@ -736,19 +737,40 @@ end
 """
 send(x) = send_frame(encode(x))
 
-# the frames of an `.inb` file: u32le length | frame, repeated
-function split_frames(buf::Vector{UInt8})::Vector{Vector{UInt8}}
-    out = Vector{UInt8}[]
+# the kinds of an inbox record: a message the page posted, an answer to an ask (only the page's `bridge.reply` makes
+# one: a posted message is data, whatever its keys)
+const KIND_MESSAGE = 0x00
+const KIND_REPLY = 0x01
+
+# the records of an `.inb` file: u32le length | u8 kind | frame, repeated
+function split_frames(buf::Vector{UInt8})::Vector{Tuple{UInt8,Vector{UInt8}}}
+    out = Tuple{UInt8,Vector{UInt8}}[]
     i = 1
-    while i + 3 <= length(buf)
+    while i + 4 <= length(buf)
         n = Int(buf[i]) | (Int(buf[i+1]) << 8) | (Int(buf[i+2]) << 16) | (Int(buf[i+3]) << 24)
-        i += 4
+        kind = buf[i+4]
+        (kind == KIND_MESSAGE || kind == KIND_REPLY) || throw(BridgeError(string("an inbox record of unknown kind ", kind)))
+        i += 5
         i + n - 1 <= length(buf) || throw(BridgeError("a truncated frame in the inbox"))
-        push!(out, buf[i:i+n-1])
+        push!(out, (kind, buf[i:i+n-1]))
         i += n
     end
     i == length(buf) + 1 || throw(BridgeError("a truncated frame in the inbox"))
     return out
+end
+
+# the messages of the records; the answers among them go to their asks
+function take_records(records::Vector{Tuple{UInt8,Vector{UInt8}}})::Vector{Vector{UInt8}}
+    msgs = Vector{UInt8}[]
+    for (kind, frame) in records
+        if kind == KIND_REPLY
+            m = decode(frame)
+            m isa Dict{String,Any} && deliver_reply!(m)
+        else
+            push!(msgs, frame)
+        end
+    end
+    return msgs
 end
 
 # the frames, or nothing when the bridge is closed
@@ -801,10 +823,10 @@ function receive_one(wait::Bool)::Union{Nothing,Vector{Vector{UInt8}}}
                 throw(BridgeError(string("the host could not deliver the page's messages (they stay queued on the page): ", msg)))
             end
         end
-        frames = split_frames(read(base * ".inb"))
+        records = split_frames(read(base * ".inb"))
         # (a host without julia_io events answers a waiting recv with what is there, `0`)
-        wait && h == 0 && isempty(frames) && throw(BridgeError("the host can't wait for the page (its adapter has no julia_io events)"))
-        return frames
+        wait && h == 0 && isempty(records) && throw(BridgeError("the host can't wait for the page (its adapter has no julia_io events)"))
+        return take_records(records)
     finally
         h > 0 && close_handle(h)
         rm(base * ".rq"; force = true)
@@ -822,9 +844,12 @@ there is at least one; without, returns what is there (possibly nothing). One `r
 closed, from either side (a parked `recv` wakes for it).
 """
 function recv_frames(; wait::Bool = true)::Vector{Vector{UInt8}}
-    frames = receive(wait)
-    frames === nothing && throw(closed_error())
-    return frames
+    while true
+        frames = receive(wait)
+        frames === nothing && throw(closed_error())
+        # (with `wait`, a receive of answers to asks alone waits on)
+        (isempty(frames) && wait) || return frames
+    end
 end
 
 """
@@ -856,8 +881,9 @@ const NEXT_REQUEST = Ref(Int64(0))
 
 Send `request` (a `Dict{String,Any}`, which gets a `"bridge_ask"` id; another dictionary is
 copied into one) and wait, as a task (parked on a `Channel`: no handle of its own), until the
-page answers with `{"bridge_reply": id, "value": ...}`, which [`serve`](@ref) (the task in
-`recv`) delivers. The page's error answer (`{"bridge_reply": id, "error": message}`: on the
+page answers with `bridge.reply(id, value)` (`{"bridge_reply": id, "value": ...}`, in an inbox
+record of the answers' kind, which a receive delivers: [`serve`](@ref)'s task in `recv`; a
+message the page posts is never an answer). The page's error answer (`{"bridge_reply": id, "error": message}`: on the
 page, `onAsk` threw or rejected) is an [`AskError`](@ref); a bridge closed before the answer
 (by either side, or by `serve` ending or failing) a [`BridgeClosedError`](@ref). Any number of
 tasks may ask at once; each gets its own answer, in whatever order the page answers.
@@ -945,12 +971,7 @@ function serve_loop(f::F) where {F}
         msgs = receive(true)
         msgs === nothing && return nothing
         for frame in msgs
-            m = decode(frame)
-            if m isa Dict{String,Any} && haskey(m, "bridge_reply")
-                deliver_reply!(m)
-            else
-                f(m)::Bool || return nothing
-            end
+            f(decode(frame))::Bool || return nothing
         end
     end
 end

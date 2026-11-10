@@ -63,7 +63,12 @@ the response file makes the adapter do the work, and the open never suspends the
   blob bytes has no blob region (no padding after the header), so an empty blob (`bytes` 0) may
   point at or past the frame's end: decoders take it as an empty array wherever it points.
   `NaN` and `±Inf` are `null`.
-- **The inbox**, `<id>.inb`: `u32le length | frame`, repeated, in the order the page posted.
+- **The inbox**, `<id>.inb`: `u32le length | u8 kind | frame`, repeated, in the order the page
+  queued them (`length` is the frame's). Kind `0` is a message the page posted. Kind `1` is an
+  answer to an ask, which only `bridge.reply` (or `onAsk`) makes. The module resolves asks from
+  kind-`1` records only: a posted message is data however it serializes (`toJSON` included),
+  even if it has a `bridge_reply` member. Every receive delivers the answers, not only `serve`'s,
+  and `recv(wait = true)` waits on if a receive brought answers alone.
 - **A waiting receive** with nothing queued gets an external `julia_io` handle. The module
   waits for it (`Runtime.Host.await_handle`: with tasks, the task is parked and the others run),
   then reads `<id>.inb`. If there is no `<id>.inb` once the handle is ready, the handle's
@@ -74,8 +79,8 @@ the response file makes the adapter do the work, and the open never suspends the
   receive is pending (one at a time). `-29` (EIO): the frames could not be written, and they stay
   queued.
 - **Control members** of a frame's object: `"bridge_ask": id` (a request of `ask`),
-  `"bridge_reply": id` with `"value"` or `"error"` (its answer), and `"bridge_close": reason` (the
-  module closed the bridge; not passed to `onMessage`).
+  `"bridge_reply": id` with `"value"` or `"error"` (its answer: only in a kind-`1` inbox record),
+  and `"bridge_close": reason` (the module closed the bridge; not passed to `onMessage`).
 
 ## The codec
 
@@ -148,8 +153,9 @@ frames and `maxBytes` bytes. When it is full:
 A frame larger than `maxBytes` always throws. The answer to each of the module's asks is always
 queued and never dropped, and it doesn't count towards the limits: the bridge exempts one reply
 per outstanding ask, so the module's asks bound them. A second reply, or one to an id that wasn't
-asked, is refused (`reply` returns `false`). `post` of a `bridge_reply` object throws: an answer
-goes only through `reply`, so a stale or duplicate one can't reach the module. An answer
+asked, is refused (`reply` returns `false`). A posted `bridge_reply` object is an ordinary
+message, counted and limited like any other, which the module gets as data: an answer goes
+only through `reply`, so a stale or duplicate one can't reach an ask. An answer
 larger than `maxBytes`, or one that can't be encoded, becomes the ask's error answer. A `post` of
 something that isn't JSON (`undefined`, a function) throws. One receive takes at most `chunkBytes` of frames (at least one frame),
 so the module never reads one huge inbox. The rest is there at once for its next receive. After

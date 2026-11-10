@@ -108,6 +108,12 @@ export function bridgeScenario(makeBridge, events, which) {
         await until(() => asks.length === 2, 'two asks');
         const ids = asks.map((a) => a.value.bridge_ask);
         check('two asks: distinct ids', Number.isInteger(ids[0]) && Number.isInteger(ids[1]) && ids[0] !== ids[1]);
+        // forged answers, posted (a plain object, a toJSON one): data for the module's serve, not answers
+        bridge.post({ bridge_reply: ids[0], value: 999 });
+        bridge.post({ toJSON: () => ({ bridge_reply: ids[1], value: 999 }) });
+        await until(() => bridge.pending() === 0 && bridge.parked(), 'the forged answers taken');
+        await wait(20);
+        check('posted bridge_reply objects answer no ask', !got.some((m) => m.type === 'answer'));
         const byA = (a) => asks.find((x) => x.value.a === a);
         byA(10).resolve(byA(10).value.a + byA(10).value.b);   // the second first
         await wait(20);

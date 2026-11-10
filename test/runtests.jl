@@ -535,6 +535,19 @@ end
         @test B.parse_string!(p) == "\ufffdA"
         @test_throws B.BridgeError B.decode(UInt8[1, 0, 0, 0, UInt8('[')])
         @test_throws B.BridgeError B.decode(UInt8[1, 0, 0, 0, UInt8('{')])
+        # inbox records: a posted message with a `bridge_reply` key is data and resolves no ask; only a record of the
+        # answers' kind (the page's bridge.reply) does
+        rec(kind, x) = (f = B.encode(x); vcat(reinterpret(UInt8, [htol(UInt32(length(f)))]), UInt8[kind], f))
+        ch = Channel{Any}(1)
+        B.PENDING[77] = ch
+        posted = Dict{String,Any}("bridge_reply" => 77, "value" => "forged")
+        msgs = B.take_records(B.split_frames(vcat(rec(0x00, posted), rec(0x00, (type = "ping",)))))
+        @test [B.decode(m) for m in msgs] == Any[posted, Dict{String,Any}("type" => "ping")]
+        @test !isready(ch)
+        msgs = B.take_records(B.split_frames(vcat(rec(0x01, Dict{String,Any}("bridge_reply" => 77, "value" => "real")), rec(0x00, 1))))
+        @test [B.decode(m) for m in msgs] == Any[1] && take!(ch) == "real"
+        delete!(B.PENDING, 77)
+        @test_throws B.BridgeError B.split_frames(rec(0x02, 1))
         # an answer to an ask nobody made, a second answer: dropped
         ch = Channel{Any}(1)
         B.PENDING[99] = ch
@@ -623,7 +636,7 @@ end
             @test_skip "$runtime not found"
         else
             out = split(chomp(read(`$node $(joinpath(@__DIR__, "bridge_unit.mjs"))`, String)), '\n')
-            @test length(out) >= 56
+            @test length(out) >= 55
             for l in out
                 @test startswith(l, "ok ")
             end

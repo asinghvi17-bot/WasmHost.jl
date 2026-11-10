@@ -98,6 +98,8 @@ export function decodeFrame(bytes) {
 }
 
 const EBUSY = 10, EIO = 29, EPIPE = 64;   // (WASI errnos)
+// the kinds of an inbox record: a message the page posted, an answer to an ask (only `reply` makes one)
+const KIND_MESSAGE = 0, KIND_REPLY = 1;
 // the message of a parked receive's handle when the bridge closed (src/bridge.jl reads it: no `<id>.inb`)
 export const CLOSED_PREFIX = 'wasm-bridge closed: ';
 
@@ -162,13 +164,21 @@ export function makeBridge({ events = null, onMessage = () => {}, onAsk = null, 
   }
   // write the next chunk of frames (`u32le length | frame`, repeated; at most chunkBytes, at least one frame), and
   // take them off the queue once `write` returned (it may throw: they stay queued)
+  // (a record is `u32le length | u8 kind | frame`: KIND_REPLY only for what `reply` queued, so nothing the page
+  // posts can answer an ask, whatever its JSON)
   function deliver(write) {
     let n = 0, size = 0;
-    while (n < inbox.length && (n === 0 || size + 4 + inbox[n].length <= chunkBytes)) size += 4 + inbox[n++].length;
+    while (n < inbox.length && (n === 0 || size + 5 + inbox[n].length <= chunkBytes)) size += 5 + inbox[n++].length;
     const out = new Uint8Array(size);
     const dv = new DataView(out.buffer);
     let at = 0;
-    for (let k = 0; k < n; k++) { const f = inbox[k]; dv.setUint32(at, f.length, true); out.set(f, at + 4); at += 4 + f.length; }
+    for (let k = 0; k < n; k++) {
+      const f = inbox[k];
+      dv.setUint32(at, f.length, true);
+      out[at + 4] = replies.has(f) ? KIND_REPLY : KIND_MESSAGE;
+      out.set(f, at + 5);
+      at += 5 + f.length;
+    }
     write(out);
     for (let k = 0; k < n; k++) unqueue(inbox[k]);
     inbox.splice(0, n);
@@ -211,14 +221,9 @@ export function makeBridge({ events = null, onMessage = () => {}, onAsk = null, 
   const bridge = {
     stats,
     // page -> module: queue `value`; a pending recv of the module is completed. Throws a BridgeClosedError once
-    // closed, a BridgeFullError when it does not fit (overflow 'reject'), and an Error for an answer to an ask (an
-    // object with `bridge_reply`, which the module would take as one): answers go through `reply`, which keeps
-    // the outstanding asks' books
-    post(value) {
-      if (value !== null && typeof value === 'object' && !Array.isArray(value) && Object.hasOwn(value, 'bridge_reply'))
-        throw new Error('wasmhost bridge: post of a bridge_reply object: answer an ask with bridge.reply(id, answer)');
-      enqueue(encodeFrame(value), false);
-    },
+    // closed, a BridgeFullError when it does not fit (overflow 'reject'). A posted message is never an answer to an
+    // ask, even with a `bridge_reply` member (the module gets it as data): answers go through `reply`
+    post(value) { enqueue(encodeFrame(value), false); },
     // the answer to the module's `Bridge.ask` of id `id`: a value, or a promise of one; a rejection is the ask's
     // error. `true` when it is taken; `false` (nothing queued, stats.strayReplies) for an id the module did not ask,
     // or asked and has been answered (the first reply is the answer), or on a closed bridge
