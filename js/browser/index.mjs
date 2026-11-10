@@ -4,4 +4,4 @@ export { makeImports } from './imports.mjs';
 export { perform, curlCode } from './http.mjs';
 export { decompressFile, hasFormat } from './decompress.mjs';
 export { makeShimFs } from './fs.mjs';
-export { jspiGap, promisingExports, ReentryError } from './jspi.mjs';
+export { jspiGap, promisingExports, isPoisoned, ReentryError, InstancePoisonedError } from './jspi.mjs';

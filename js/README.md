@@ -15,7 +15,7 @@ code in `common/`.
 |---|---|---|---|---|---|---|---|
 | `common/` | (bundled into each) | any | protocol `wasm-fetch 1`, libcurl's error codes | protocol `wasm-decompress 1`, magic bytes | merging, checking, `WASMHOST_PLATFORM` | – | through Node and Chromium |
 | `node/` | `@wasmhost/node` | Node 22+ and Bun 1.4+ (`node:wasi`) | spool: `spool.mjs`; import: `imports.mjs` | spool: gzip, deflate; zstd on Node ≥ 22.15 (`node:zlib`) | `platform.mjs` (arch, os, libc) | JSPI; sync worker + `Atomics.wait` (spool) | **yes**, end to end against native |
-| `browser/` | `@wasmhost/browser` | browsers with JSPI (Chrome/Edge 137+), on `@bjorn3/browser_wasi_shim` | spool: `spool.mjs`; import: `imports.mjs` (bodies in the shim's in-memory filesystem) | spool: `DecompressionStream`: gzip, deflate; zstd where the browser has it (not Chromium 158) | none to detect | JSPI only; one call at a time per module (`promisingExports`) | **yes**, end to end against native in headless Chromium 158 (Playwright); decompression: the adapter alone |
+| `browser/` | `@wasmhost/browser` | browsers with JSPI (Chrome/Edge 137+), on `@bjorn3/browser_wasi_shim` | spool: `spool.mjs`; import: `imports.mjs` (bodies in the shim's in-memory filesystem) | spool: `DecompressionStream`: gzip, deflate; zstd where the browser has it (not Chromium 158) | none to detect | JSPI only; one call at a time per module (`promisingExports`); a re-entrant call poisons the instance (make a new one) | **yes**, end to end against native in headless Chromium 158 (Playwright); decompression: the adapter alone |
 | `workerd/` | – | Cloudflare workerd | import | `DecompressionStream` | – | JSPI if available | **no**: notes |
 | `wasmtime/` | – | wasmtime | import, from an embedding | the embedding's | the embedding's | the embedding's | **no**: notes |
 
@@ -75,5 +75,5 @@ await promisingExports(inst).main();                 // one call at a time per m
 - Takes the shim's WASI instance rather than Node's `preopens`: the shim's preopens and its
   in-memory files are the module's filesystem, which the adapter reads and writes through the
   shim's own directory operations (no import of the shim).
-- Needs JSPI (Chrome/Edge 137+); one call at a time per module (`promisingExports`); the
+- Needs JSPI (Chrome/Edge 137+); one call at a time per module (`promisingExports`; a re-entrant call poisons the instance); the
   browser's User-Agent replaces the program's; CORS applies; no credentials by default. See [`browser/README.md`](browser/README.md).

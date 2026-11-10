@@ -18,7 +18,9 @@
 //     written back; returns its length (or -length when res_cap is too small: nothing
 //     written). Suspending (JSPI): the export must be called through WebAssembly.promising
 //     (promisingExports). A request while another of the module is in flight (the page called
-//     the module directly, again) throws a ReentryError into the module.
+//     the module directly, again) throws a ReentryError into the re-entrant call and poisons the
+//     instance: the suspended call rejects with an InstancePoisonedError instead of resuming, as
+//     does every later call (jspi.mjs); recovery is a new instance.
 // `fetchImpl` replaces `fetch`; `credentials` is fetch's (default 'omit').
 import { parseRequest, formatResult } from '../common/fetch.mjs';
 import { makeShimFs, posix } from './fs.mjs';

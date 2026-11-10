@@ -16,7 +16,8 @@
 #   the page on one origin and server.mjs on another (CORS); the browser sends its own User-Agent instead of
 #   Downloads', so the native T3 body line is compared with the browser's User-Agent in it. decompress: the browser
 #   adapter's decompression alone (browser/decompress.mjs), as dprog.jl needs WasmCodegen's julia_regex. spool and
-#   import also call main twice at once through promisingExports (queued; rejected), and check the host guard.
+#   import also call main twice at once through promisingExports (queued; rejected), check the host guard, and re-enter the
+#   module behind the queue (reentry.mjs: the instance is poisoned).
 #
 # Environment: JULIA (default: this julia), WASM_RUNTIME (node, the default, bun or chromium), NODE (default: `node` on PATH,
 # Node 22+ with JSPI; zstd needs 22.15+) or BUN (default: `bun` on PATH), WASMBUILDER / IRSTRUCTURIZER (paths, optional: otherwise WasmCodegen's own
@@ -118,7 +119,7 @@ function downloads(env, transport)
                occursin("spool files left: 0", out)
         println("== $transport/$mode: ", same ? "IDENTICAL to native" * (BROWSER ? " (the echoed User-Agent: the browser's)" : "") : "DIFFERENT", "\n", out)
         ok &= same
-        BROWSER && (ok &= twice(wasm, mode, native))
+        BROWSER && (ok &= twice(wasm, mode, native) & reentry(wasm, mode))
     end
     return ok
 end
@@ -138,13 +139,24 @@ function twice(wasm, mode, native)
         else
             guard = lines(out, "host guard: ")
             good &= lines(out, "T") == want && occursin(r"^second call: rejected: ReentryError: "m, out) &&
-                    length(guard) == 4 && all(endswith(": true"), guard)
+                    length(guard) == 6 && all(endswith(": true"), guard)
         end
         println("== $mode, main twice at once ($how): ", good ? (how == "queue" ? "both IDENTICAL to native, one after the other" :
                                                                 "the second REJECTED, the first IDENTICAL to native") : "WRONG", "\n", out)
         ok &= good
     end
     return ok
+end
+
+# (a browser) the module re-entered while it waits for the host (the page calls it behind promisingExports' queue): the
+# re-entrant call fails with a ReentryError and the instance is poisoned: the suspended main and the queued one reject
+# with an InstancePoisonedError, as does every call after (browser/reentry.mjs); a rejected executing export lets the
+# queued call run
+function reentry(wasm, mode)
+    out = output(`$node $(joinpath(HERE, "browser", "reentry.mjs")) $wasm $mode`)
+    good = occursin("REENTRY PASS", out)
+    println("== $mode, module re-entered: ", good ? "POISONED as it should be" : "WRONG", "\n", out)
+    return good
 end
 
 # the compressed artifact, both encodings of the Pkg server
