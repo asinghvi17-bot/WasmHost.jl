@@ -31,7 +31,9 @@
 // `promisingExports(inst)`, which also keeps to one call at a time per module (Julia's runtime
 // isn't re-entrant). (A page's main thread can't block, so Node's 'sync' mode has no browser
 // counterpart.) A job that starts while another of the module is suspended (the page called the
-// module directly, again) throws a ReentryError into the module.
+// module directly, again) throws a ReentryError into the re-entrant call and poisons the
+// instance: the suspended call rejects with an InstancePoisonedError instead of resuming, as does
+// every later call (jspi.mjs); recovery is a new instance.
 // `fetchImpl` replaces `fetch`; `credentials` is fetch's (default 'omit': the page's cookies
 // aren't the program's); `wasiImport` replaces `wasi.wasiImport` (e.g. a wrapped one); `events`:
 // the julia_io events (WasmCodegen's js/julia_io.mjs) of a module with tasks, whose exports are

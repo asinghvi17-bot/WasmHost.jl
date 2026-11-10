@@ -38,7 +38,10 @@ await exports.main();
   through WasmCodegen's julia_task `tasks.call`, and without `jl_task_entry`), one call at a time: a call made while
   another is in flight waits for it to settle (`whenBusy: 'queue'`, the default) or is rejected
   with a `ReentryError` (`'reject'`). Call the module only through these (see
-  [one call at a time](#requirements-and-limits)).
+  [one call at a time](#requirements-and-limits)). Once the instance is
+  [poisoned](#requirements-and-limits), they all reject with an `InstancePoisonedError`.
+- `isPoisoned(instance)`, `ReentryError`, `InstancePoisonedError`: see
+  [one call at a time](#requirements-and-limits).
 - `wrapWasi(wasi, { spool, fetchImpl, credentials, wasiImport })`: wraps the shim's `path_open`, as
   `../node/spool.mjs` does Node's: opening `<spool>/<id>.res` performs `<spool>/<id>.req`,
   opening `<spool>/<id>.dres` decompresses as `<spool>/<id>.dreq` asks. `wasiImport` replaces
@@ -73,8 +76,8 @@ await exports.main();
   A request starts without suspending (`<id>.hnd`, `wasm_host.http_start`); the task waits for
   its `julia_io` handle while the others run. The re-entry guard then refuses a start, or a
   suspending job, while the module is suspended in a job or in julia_io's `poll`
-  (`notSuspended`, `oneAtATime(wasi, events)`); starts of the running call's tasks overlap
-  freely. The browser opens at most 6 connections per host for HTTP/1.1, so more requests to
+  (`notSuspended`, `oneAtATime(wasi, events)`), and poisons the instance as below; starts of
+  the running call's tasks overlap freely. The browser opens at most 6 connections per host for HTTP/1.1, so more requests to
   one host than that overlap in rounds.
 - `makeShimJuliaIOPaths(wasi)`: `julia_io`'s `path_mode`, `path_chmod`, `path_symlink` on the
   shim (no permission bits, no links: a file is 0o100644, a directory 0o040755; chmod and
@@ -97,9 +100,22 @@ await exports.main();
   the module only through `promisingExports(instance)`, which keeps to this (queueing or
   rejecting). A page that calls `instance.exports` directly in the meantime runs Julia code
   re-entrantly, which nothing can make safe; the adapter catches it at the latest when that call
-  needs the host (a download or a decompression while another is in flight): it throws a
-  `ReentryError` into the module, which unwinds the re-entrant call (WasmCodegen's handlers
-  catch only Julia's own exceptions) and rejects its promise.
+  needs the host (a download, a decompression, or a request a task starts while the module is
+  suspended).
+- **A re-entrant call poisons the instance:** at that point the adapter throws a `ReentryError`
+  into the re-entrant call, but cannot unwind it safely: WasmCodegen's handlers catch only
+  Julia's own exceptions, so a foreign JavaScript exception passes through the module's frames
+  without running its `finally` blocks and `catch` handlers. What they release or remove (a lock,
+  the request file of a spool exchange, ...) stays as it is, and the suspended call would
+  resume on top of it. So the adapter makes the guard hit fatal to the instance: the
+  re-entrant call fails with the `ReentryError`; the suspended export rejects with an
+  `InstancePoisonedError` (`cause`: the `ReentryError`) when it would resume, and returns no
+  result; and every later call through `promisingExports` rejects at once with an
+  `InstancePoisonedError`, the ones queued included, as does every later host request.
+  `isPoisoned(instance)` tells. Nothing repairs a poisoned instance: **recovery is a new
+  instance** (instantiate the module again, with a new WASI instance and adapter, the same
+  compiled `WebAssembly.Module`). Only a call that needs the host is caught: a re-entrant call
+  that finishes without one is not, which is why you call the module through `promisingExports`.
 - **User-Agent:** the browser's, not the program's. The Fetch standard no longer forbids
   setting `User-Agent`, but Chromium drops it silently from `fetch` requests
   ([crbug 571722](https://crbug.com/571722)), Downloads' default one included; the e2e checks
@@ -140,7 +156,13 @@ WASM_RUNTIME=chromium julia test/e2e/e2e.jl /path/to/WasmCodegen.jl all
   `promisingExports`: queued, both runs must equal native's, one after the other; with
   `whenBusy: 'reject'`, the second must be a `ReentryError` and the first equal native's. The
   adapter's host guard is checked on its own too (a second job of an instance is a
-  `ReentryError` until the first settles; other instances are not blocked).
+  `ReentryError` and poisons it; other instances are not blocked). Then the module is
+  re-entered on purpose (`browser/reentry.mjs`, with the queue bypassed: `WebAssembly.promising`
+  on the raw export while `main` waits for its first request): the re-entrant call must fail
+  with a `ReentryError`, the suspended `main` and a queued one must reject with an
+  `InstancePoisonedError` (neither returns a result, the queued one never runs), and so must
+  every call after. The queue is checked with a hand-assembled module too: an export that traps
+  while executing lets the call queued behind it run (`whenBusy: 'queue'`).
 - **decompress:** `browser/decompress.mjs`, the adapter alone in Chromium: gzip, deflate and
   zstd made by `node:zlib` must decompress to the original bytes (or zstd `ENOSYS`), and the
   error cases must give WasmHost.Decompress's errnos. (`test/e2e/dprog.jl` needs WasmCodegen's

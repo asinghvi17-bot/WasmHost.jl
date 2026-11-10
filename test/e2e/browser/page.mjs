@@ -3,7 +3,7 @@
 // the adapter's decompression.
 import { WASI, File, OpenFile, Directory, PreopenDirectory, ConsoleStdout } from '@bjorn3/browser_wasi_shim';
 import { wrapWasi, makeImports, decompressFile, hasFormat, makeShimFs, makeShimJuliaIOPaths, jspiGap, promisingExports,
-         ReentryError, oneAtATime, notSuspended } from '/js/browser/index.mjs';
+         isPoisoned, ReentryError, InstancePoisonedError, oneAtATime, notSuspended } from '/js/browser/index.mjs';
 
 const hex = (b) => [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, '0')).join('');
 const sha256 = async (b) => hex(await crypto.subtle.digest('SHA-256', b));
@@ -52,21 +52,119 @@ window.runModule = async ({ wasm, mode, base, twice }) => {
   return out;
 };
 
-// window.checkHostGuard() -> [what, ok]: the adapter's guard of host jobs (oneAtATime), which a page that calls the
-// module directly while it waits runs into: a second job of an instance is a ReentryError until the first settles
+// The module of both checks below, and the same wiring as runModule's: { out, root, adapter, inst, wasi }.
+async function instantiate({ wasm, mode, base }) {
+  const mod = await WebAssembly.compileStreaming(fetch(wasm));
+  const out = { stdout: [], stderr: [] };
+  const root = new PreopenDirectory('/work', new Map([['out', new Directory(new Map())]]));
+  const env = [`FETCH_BASE=${base}`, 'FETCH_OUT=/work/out', 'PWD=/work', 'WASMHOST_SPOOL=/work/.wasmhost'];
+  const wasi = new WASI(['fetch'], env, [
+    new OpenFile(new File([])),
+    ConsoleStdout.lineBuffered((l) => out.stdout.push(l)),
+    ConsoleStdout.lineBuffered((l) => out.stderr.push(l)),
+    root], { debug: false });
+  let adapter, imports;
+  if (mode === 'import') {
+    adapter = makeImports({ wasi, spool: '/work/.wasmhost' });
+    imports = { wasi_snapshot_preview1: wasi.wasiImport, ...adapter.imports };
+  } else {
+    adapter = wrapWasi(wasi, { spool: '/work/.wasmhost' });
+    imports = { wasi_snapshot_preview1: adapter.wasiImport };
+  }
+  const inst = await WebAssembly.instantiate(mod, imports);
+  adapter.bindMemory(inst.exports.memory);
+  wasi.initialize(inst);
+  return { out, root, adapter, inst, wasi };
+}
+
+const settled = (p) => p.then((v) => ({ ok: true, value: v }), (e) => ({ ok: false, name: e?.name, message: String(e?.message), cause: e?.cause?.name }));
+// (whether a promise has settled after `ticks` microtask turns: what "rejects immediately" means)
+const settlesSoon = async (p, ticks = 20) => {
+  let done = false;
+  settled(p).then(() => { done = true; });
+  for (let i = 0; i < ticks; i++) await null;
+  return done;
+};
+
+// window.checkReentry({ wasm, mode, base }) -> [what, ok]: the real module (prog.jl's) re-entered while it waits for the
+// host: `main` is in flight through promisingExports (waiting for its first request); the page then calls the module
+// again behind the queue's back, with WebAssembly.promising on the raw export (what a page that doesn't use
+// promisingExports does), and queues another main through promisingExports. The host guard catches the re-entrant
+// call's first request: it fails with a ReentryError, and the instance is poisoned. The suspended main rejects with an
+// InstancePoisonedError when it would resume (not a result), the queued main rejects too without running, and a
+// call after all that rejects at once.
+window.checkReentry = async (cfg) => {
+  const { adapter, inst } = await instantiate(cfg);
+  const exports = promisingExports(inst);               // (queue: the default)
+  const raw = WebAssembly.promising(inst.exports.main);
+  const first = settled(exports.main());
+  while (adapter.stats.requests + (adapter.stats.decompress ?? 0) === 0) await null;   // (main is suspended in its first request)
+  const before = isPoisoned(inst);
+  const reentrant = settled(raw());
+  const queued = settled(exports.main());
+  const [r0, r1, r2] = await Promise.all([first, reentrant, queued]);
+  const later = exports.main();
+  const immediate = await settlesSoon(later);
+  const r3 = await settled(later);
+  const requests = adapter.stats.requests;
+  const afterwards = await Promise.all(Object.keys(exports).filter((k) => k !== 'memory').map((k) => settled(exports[k]())));
+  const poisonedName = (r) => !r.ok && r.name === 'InstancePoisonedError' && r.cause === 'ReentryError';
+  return [['not poisoned before the re-entrant call', before === false],
+          [`the re-entrant call fails with a ReentryError (${r1.name})`, !r1.ok && r1.name === 'ReentryError'],
+          ['the instance is poisoned', isPoisoned(inst) === true],
+          [`the suspended main rejects with an InstancePoisonedError caused by the ReentryError (${r0.ok ? 'returned ' + r0.value : r0.name})`, poisonedName(r0)],
+          [`the queued main rejects with an InstancePoisonedError (${r2.ok ? 'returned ' + r2.value : r2.name})`, poisonedName(r2)],
+          [`a call after that rejects at once (${r3.name})`, immediate && poisonedName(r3)],
+          ['the queued main never ran (only the suspended one\'s request was made)', requests === 1],
+          ['every export rejects now', afterwards.length > 0 && afterwards.every(poisonedName)]];
+};
+
+// window.checkQueueAfterRejection() -> [what, ok]: promisingExports' queue on a module of two hand-assembled exports,
+// `boom` (traps) and `ok` (returns 7): a call that rejects, executing, lets the queued ones run (whenBusy 'queue');
+// with 'reject', the call after it is accepted too. A trap isn't a re-entrant call: nothing is poisoned.
+window.checkQueueAfterRejection = async () => {
+  // (module (func (export "boom") unreachable) (func (export "ok") (result i32) i32.const 7))
+  const bytes = Uint8Array.from([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0,
+    1, 8, 2, 0x60, 0, 0, 0x60, 0, 1, 0x7f,
+    3, 3, 2, 0, 1,
+    7, 13, 2, 4, 0x62, 0x6f, 0x6f, 0x6d, 0, 0, 2, 0x6f, 0x6b, 0, 1,
+    10, 10, 2, 3, 0, 0, 0x0b, 4, 0, 0x41, 7, 0x0b]);
+  const { instance } = await WebAssembly.instantiate(bytes, {});
+  const q = promisingExports(instance);
+  const [a, b, c] = await Promise.all([settled(q.boom()), settled(q.ok()), settled(q.ok())]);
+  const d = await settled(q.ok());
+  const rejecting = promisingExports((await WebAssembly.instantiate(bytes, {})).instance, { whenBusy: 'reject' });
+  const e = await settled(rejecting.boom());
+  const f = await settled(rejecting.ok());
+  return [['the executing export rejects (the trap)', !a.ok && a.name === 'RuntimeError'],
+          ['the call queued behind it runs', b.ok && b.value === 7],
+          ['and the one behind that', c.ok && c.value === 7],
+          ['a call after the queue drained runs', d.ok && d.value === 7],
+          ['whenBusy reject: the trap rejects', !e.ok],
+          ['whenBusy reject: the call after it is accepted', f.ok && f.value === 7],
+          ['a trap does not poison', !isPoisoned(instance)]];
+};
+
+// window.checkHostGuard() -> [what, ok]: the adapter's guard of host jobs (oneAtATime) on its own, which a page that calls
+// the module directly while it waits runs into: a second job of an instance is a ReentryError and poisons the instance
+// (and the module instance its WASI instance was initialized with): the first job rejects with an InstancePoisonedError
+// instead of resuming its caller, and so does every job after it; other instances are not blocked
 window.checkHostGuard = async () => {
-  const wasi = {}, run = oneAtATime(wasi), other = oneAtATime(wasi), elsewhere = oneAtATime({});
+  const inst = {}, wasi = { inst }, run = oneAtATime(wasi), other = oneAtATime(wasi), elsewhere = oneAtATime({});
   let release;
-  const first = run(() => new Promise((r) => { release = r; }));
-  const second = await other(async () => 'ran').then((v) => v, (e) => e);
-  const third = await elsewhere(async () => 'ran');       // (another instance: not blocked)
+  const first = settled(run(() => new Promise((r) => { release = r; })));
+  const second = await settled(other(async () => 'ran'));
+  const third = await settled(elsewhere(async () => 'ran'));       // (another instance: not blocked)
+  const poisoned = isPoisoned(inst);
   release('first');
   const done = await first;
-  const after = await run(async () => 'ran');
-  return [['second job while the first is in flight: ReentryError', second instanceof ReentryError],
-          ['a job of another instance runs', third === 'ran'],
-          ['the first job completes', done === 'first'],
-          ['a job after the first settled runs', after === 'ran']];
+  const after = await settled(run(async () => 'ran'));
+  return [['second job while the first is in flight: ReentryError', !second.ok && second.name === 'ReentryError'],
+          ['the instance (not another) is poisoned', poisoned && !isPoisoned({}) && isPoisoned(wasi)],
+          ['a job of another instance runs', third.ok && third.value === 'ran'],
+          ['the first job rejects with an InstancePoisonedError', !done.ok && done.name === 'InstancePoisonedError' && done.cause === 'ReentryError'],
+          ['a job after the first settled is refused', !after.ok && after.name === 'InstancePoisonedError'],
+          ['a job without the guard hit runs', (await settled(oneAtATime({})(async () => 'ran'))).ok]];
 };
 
 // window.checkDecompress(cases) -> [{ name, errno, message, sha256, dstExists }]: decompressFile on the shim's
@@ -156,24 +254,37 @@ window.runConcurrent = async ({ wasm, mode, base, n, events: useEvents = true, t
 };
 
 window.checkTaskGuard = async () => {
-  const wasi = {};
-  let polling = false;
-  const events = { polling: () => polling };
-  const check = notSuspended(wasi, events), run = oneAtATime(wasi, events);
-  const refused = (f) => { try { f(); return false; } catch (e) { return e instanceof ReentryError; } };
-  const startsWhileRunning = !refused(check) && !refused(check);       // (two starts of running tasks: both fine)
-  polling = true;
-  const startWhilePolling = refused(check);
-  const jobWhilePolling = await run(async () => 'ran').then(() => false, (e) => e instanceof ReentryError);
-  polling = false;
+  // (each case on an instance of its own: a guard hit poisons the instance)
+  const guard = () => {
+    const g = { inst: {}, polling: false };
+    g.wasi = { inst: g.inst };
+    const events = { polling: () => g.polling };
+    g.check = notSuspended(g.wasi, events);
+    g.run = oneAtATime(g.wasi, events);
+    return g;
+  };
+  const refused = (f, E = ReentryError) => { try { f(); return false; } catch (e) { return e instanceof E; } };
+  const a = guard();
+  const startsWhileRunning = !refused(a.check) && !refused(a.check) && !isPoisoned(a.inst);  // (two starts of running tasks: both fine)
+  const b = guard();
+  b.polling = true;
+  const startWhilePolling = refused(b.check) && isPoisoned(b.inst);
+  b.polling = false;
+  const startAfterPoison = refused(b.check, InstancePoisonedError);
+  const c = guard();
+  c.polling = true;
+  const jobWhilePolling = await c.run(async () => 'ran').then(() => false, (e) => e instanceof ReentryError) && isPoisoned(c.inst);
+  const d = guard();
   let release;
-  const first = run(() => new Promise((r) => { release = r; }));
-  const startWhileJob = refused(check);
+  const first = d.run(() => new Promise((r) => { release = r; })).then(() => null, (e) => e);
+  const startWhileJob = refused(d.check) && isPoisoned(d.inst);
   release();
-  await first;
+  const firstErr = await first;
   return [['starts while the module runs: allowed', startsWhileRunning],
-          ['a start while it is suspended in poll: ReentryError', startWhilePolling],
-          ['a suspending job while it is suspended in poll: ReentryError', jobWhilePolling],
-          ['a start while a suspending job is in flight: ReentryError', startWhileJob]];
+          ['a start while it is suspended in poll: ReentryError, poisoned', startWhilePolling],
+          ['a start after that: InstancePoisonedError', startAfterPoison],
+          ['a suspending job while it is suspended in poll: ReentryError, poisoned', jobWhilePolling],
+          ['a start while a suspending job is in flight: ReentryError, poisoned', startWhileJob],
+          ['that job rejects with an InstancePoisonedError', firstErr instanceof InstancePoisonedError]];
 };
 window.ready = true;
