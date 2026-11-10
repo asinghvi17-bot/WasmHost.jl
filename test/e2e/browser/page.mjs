@@ -120,6 +120,13 @@ window.checkReentry = async (cfg) => {
           ['every export rejects now', afterwards.length > 0 && afterwards.every(poisonedName)]];
 };
 
+// (outside the async check below, whose saved registers could keep the object alive): calls main with an argument
+// only the returned WeakRef knows: { queued: the call's promise, token: the WeakRef }
+function queueWithArgument(exports) {
+  const o = { big: new Uint8Array(1 << 20) };
+  return { queued: exports.main(o), token: new WeakRef(o) };
+}
+
 // window.checkStalledReentry({ wasm, mode, base }) -> [what, ok]: the first host job is held open (a fetch that doesn't
 // settle until released), a main is queued behind it BEFORE the page re-enters the module, then the re-entrant call
 // poisons the instance. The queued main rejects with an InstancePoisonedError at once, while the first job is still
@@ -136,11 +143,19 @@ window.checkStalledReentry = async (cfg) => {
   const raw = WebAssembly.promising(inst.exports.main);
   const first = settled(exports.main());
   while (fetches === 0) await null;                      // (main is suspended in its first request, which is held open)
-  const queued = exports.main();                         // (queued behind it, before the re-entry)
+  // (queued behind it, before the re-entry, with an argument only a WeakRef knows: once rejected, nothing may keep
+  // the argument alive while the first request is stalled)
+  const { queued, token } = queueWithArgument(exports);
   const queuedSettled = settled(queued);
   const reentrant = await settled(raw());                // (the host guard: poisons the instance)
   const promptly = await settlesSoon(queued, 200);       // (the first job is still stalled: nothing released it)
   const stillStalled = fetches === 1;
+  let collected = false;
+  // (a deref keeps its target alive for the rest of the job, so each gc() starts one: after a turn of the event loop)
+  for (let i = 0; i < 20 && !collected; i++) {
+    await new Promise((r) => setTimeout(r, 10)); globalThis.gc?.(); await new Promise((r) => setTimeout(r, 10));
+    collected = token.deref() === undefined;
+  }
   if (!promptly) release();                              // (a failure must not hang the check)
   const r2 = await queuedSettled;
   const later = exports.main();
@@ -157,6 +172,7 @@ window.checkStalledReentry = async (cfg) => {
           ['the first job is still stalled when the queued main is rejected', !r0Early && stillStalled],
           [`the queued main rejects at once, with an InstancePoisonedError (${r2.ok ? 'returned ' + r2.value : r2.name})`, promptly && poisonedName(r2)],
           [`a call after that rejects at once (${r3.name})`, immediate && poisonedName(r3)],
+          ['the rejected queued call\'s argument is collected while the first request is still stalled', typeof globalThis.gc === 'function' && collected && stillStalled],
           [`the suspended main rejects with an InstancePoisonedError once its request settles (${r0.ok ? 'returned ' + r0.value : r0.name})`, poisonedName(r0)],
           ['the queued main never ran (only the first main made a request)', fetches === 1],
           ['the instance is poisoned, and a new one from the same module is not', isPoisoned(inst) && !isPoisoned(fresh.inst)],

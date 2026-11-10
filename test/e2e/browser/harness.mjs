@@ -26,7 +26,7 @@ export async function serveStatic(wasm) {
 
 // Open the e2e page in a headless Chromium: { browser, page }. The page's console goes to stderr.
 export async function openPage(origin) {
-  const browser = await chromium.launch();
+  const browser = await chromium.launch({ args: ['--js-flags=--expose-gc'] })      // (gc(): the reentry check of what a rejected call retains);
   const page = await browser.newPage();
   page.on('console', (m) => console.error('[page]', m.text()));
   page.on('pageerror', (e) => console.error('[page error]', e.message));

@@ -46,7 +46,7 @@ function poison(wasi, cause) {
   poisoned.set(wasi.inst, cause);
   // the calls still queued behind the one in flight reject now, not when that one settles (it may be stalled for good)
   const state = calls.get(wasi.inst);
-  for (const entry of state?.waiting ?? []) entry.reject(poisonedError(wasi.inst, `${entry.name} not run`));
+  for (const entry of state?.waiting ?? []) entry.args = null, entry.reject(poisonedError(wasi.inst, `${entry.name} not run`));
 }
 
 // throws an InstancePoisonedError (what: what it stops) if `key` (an instance or a WASI instance) is poisoned
@@ -62,7 +62,8 @@ function poisonedError(key, what) {
 }
 
 // per instance: the export in flight (or queued), the tail of the queue, and the queued calls that haven't started
-// (`waiting`: { name, reject }, for poisoning to reject at once)
+// (`waiting`: { name, args, reject }, for poisoning to reject at once and drop their arguments: the step chained on
+// `tail` can't be unlinked, and stays until the call in flight settles, which may be never)
 const calls = new WeakMap();
 
 /**
@@ -91,12 +92,13 @@ export function promisingExports(instance, { whenBusy = 'queue' } = {}) {
         return Promise.reject(new ReentryError(`wasmhost: ${name} called while ${state.current ?? 'another export'} is in flight (one call at a time per module)`));
       if (state.pending++ === 0) state.current = name;
       // (poisoned while it waited in the queue, or while it ran: whatever it returns is not to be trusted)
-      const entry = { name, reject: null };
+      const entry = { name, args, reject: null };
       const turn = new Promise((_, reject) => { entry.reject = reject; });
       state.waiting.add(entry);
       const run = Promise.race([turn, state.tail.then(() => {
           // (rejected by poisoning while it waited, so already settled: it never runs)
           if (!state.waiting.delete(entry)) return;
+          const { args } = entry; entry.args = null;
           checkPoisoned(instance, `${name} not run`); state.current = name; return p(...args); })])
         .then((result) => { checkPoisoned(instance, `${name} abandoned`); return result; },
               (err) => { if (!(err instanceof InstancePoisonedError)) checkPoisoned(instance, `${name} abandoned`); throw err; })
