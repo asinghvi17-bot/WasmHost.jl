@@ -382,7 +382,14 @@ window.runBridge = async ({ wasm, which }) => {
     isPoisoned: () => isPoisoned(inst),
     again: () => exports.main(),
   };
-  out.checks = await s.run({ main: exports.main(), stdout: () => out.stdout, raw });
+  // (write-fails: the adapter's next creation of an inbox file throws, in the shim's directory)
+  let failInbox = false;
+  const pathOpen = root.path_open.bind(root);
+  root.path_open = (dirflags, path, oflags, ...rest) => {
+    if (failInbox && (oflags & 1) && String(path).endsWith('.inb')) { failInbox = false; throw new Error('injected write failure'); }
+    return pathOpen(dirflags, path, oflags, ...rest);
+  };
+  out.checks = await s.run({ main: exports.main(), stdout: () => out.stdout, raw, failInboxWrite: () => { failInbox = true; } });
   out.stats = s.bridge.stats;
   out.spoolLeft = root.dir.contents.get('.wasmhost')?.contents.size ?? -1;
   jt.shutdown();

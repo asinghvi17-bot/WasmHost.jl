@@ -3,7 +3,8 @@
 // [what, ok]; a case passes when all are true.
 //
 //   const s = bridgeScenario(makeBridge, events, which);   // s.bridge: give it to the adapter (wrapWasi)
-//   const checks = await s.run({ main, stdout, raw });       // main: the promise of `main`; stdout(): its lines so far
+//   const checks = await s.run({ main, stdout, raw, failInboxWrite });   // main: the promise of `main`; stdout(): its
+//                                                                          // lines so far
 //
 // raw (reentry, a browser): { poke, poke_recv, isPoisoned, again } calls into the module that bypass promisingExports.
 
@@ -19,27 +20,21 @@ export function bridgeScenario(makeBridge, events, which) {
   const got = [];      // what the module sent (onMessage), in order
   const asks = [];     // the module's asks: { value, resolve, reject }
   const closes = [];   // [reason, by] of onClose
-  let throwNext = false;   // (write-fails) the next write of the frames throws
   const bridge = makeBridge({
     events, capacity: 64, chunkBytes: 256,
     onMessage: (v) => { got.push(v); },
     onAsk: (v) => new Promise((resolve, reject) => { asks.push({ value: v, resolve, reject }); }),
     onClose: (reason, by) => { closes.push([reason, by]); },
   });
-  if (which === 'write-fails') {
-    const startRecv = bridge.startRecv;
-    bridge.startRecv = (w, write) => startRecv(w, (bytes) => {
-      if (throwNext) { throwNext = false; throw new Error('injected write failure'); }
-      return write(bytes);
-    });
-  }
   const until = async (f, what, ms = 20000) => {
     for (const t0 = Date.now(); !f(); await wait(2)) if (Date.now() - t0 > ms) throw new Error(`timeout: ${what}`);
   };
   const msg = (type, extra = () => true) => got.find((m) => m.type === type && extra(m));
   const postThrows = (v) => { try { bridge.post(v); return null; } catch (e) { return errName(e); } };
 
-  async function run({ main, stdout, raw }) {
+  // failInboxWrite(): (write-fails) the driver makes the adapter's next write of an `<id>.inb` file throw
+  // "injected write failure", below the adapter (node:fs, the shim's directory)
+  async function run({ main, stdout, raw, failInboxWrite }) {
     const checks = [];
     const check = (what, ok) => { checks.push([what, !!ok]); };
     let rc, mainErr = null;
@@ -166,7 +161,7 @@ export function bridgeScenario(makeBridge, events, which) {
         check('no recv left parked', !bridge.parked());
         check('a post after close: BridgeClosedError', postThrows({ type: 'late' }) === 'BridgeClosedError');
       } else if (which === 'write-fails') {
-        throwNext = true;
+        failInboxWrite();
         bridge.post({ type: 'kept' });
         await settled;
         check('main returned 0', rc === 0 && mainErr === null);

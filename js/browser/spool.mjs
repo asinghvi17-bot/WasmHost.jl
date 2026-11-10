@@ -47,7 +47,7 @@ import { makeShimFs, posix } from './fs.mjs';
 import { perform } from './http.mjs';
 import { decompressFile, errnoOf } from './decompress.mjs';
 import { jspiGap, oneAtATime, notSuspended } from './jspi.mjs';
-import { serveBridgeFile } from '../common/bridge.mjs';
+import { attachBridge } from '../common/bridge.mjs';
 
 const KINDS = [
   { kind: 'fetch', res: '.res', req: '.req' },
@@ -78,6 +78,8 @@ export function wrapWasi(wasi, { spool, fetchImpl, credentials, wasiImport = was
   const original = wasiImport.path_open;
   const stats = { requests: 0, decompress: 0, started: 0, batches: 0 };
   const jobs = checkEvents(events) && makeJobs(events, stats);
+  // (the bridge's module side: this adapter's alone)
+  const port = bridge ? attachBridge(bridge) : null;
   const exclusive = oneAtATime(wasi, events);
   const check = notSuspended(wasi, events);
 
@@ -147,7 +149,7 @@ export function wrapWasi(wasi, { spool, fetchImpl, credentials, wasiImport = was
   function bridged(p) {
     check();
     const inb = p.req.slice(0, -'.rq'.length) + '.inb';
-    serveBridgeFile(bridge, p.kind, {
+    port.serveFile(p.kind, {
       read: () => new Uint8Array(fs.read(p.req)),
       answer: (text) => fs.write(p.res, encoder.encode(text)),
       writeInbox: (bytes) => fs.write(inb, bytes),

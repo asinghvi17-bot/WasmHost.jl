@@ -3,14 +3,15 @@
 //
 //   const bridge = makeBridge({ events, onMessage: (value) => ..., onAsk: async (request) => answer });
 //   const host = wrapWasi(..., { events, bridge });                     // the adapter serves the module's side
+//                                                                       // (attachBridge: once; not the page's)
 //   bridge.post({ msg_type: '0', id: obsId, payload: ... });            // page -> module
 //   bridge.close('page closed');                                        // the end: the module's recv and asks fail
 //
-// - Module to page: the module opens `<id>.snd` after writing `<id>.out`; the adapter calls
-//   `bridge.send(bytes)`, which decodes the frame and calls `onMessage(value, bytes)` (or `onAsk`, for a request of
+// - Module to page: the module opens `<id>.snd` after writing `<id>.out`; the adapter calls its port's
+//   `send(bytes)` (attachBridge), which decodes the frame and calls `onMessage(value, bytes)` (or `onAsk`, for a request of
 //   `Bridge.ask`). Synchronous: it never suspends the module. What `onMessage` throws is the module's `send` error.
 // - Page to module: `bridge.post(value)` queues a frame. The module's `recv` opens `<id>.rcv` after writing
-//   `<id>.rq`; the adapter calls `bridge.startRecv(wait, write)`. If a frame is queued (or the module does not
+//   `<id>.rq`; the adapter calls its port's `startRecv(wait, write)`. If a frame is queued (or the module does not
 //   wait) the frames are written at once (`write(bytes)`, the `<id>.inb` file) and the handle is `0`; else an
 //   external julia_io handle (`events.external()`) is returned, and made ready, with the frames written first,
 //   when the page posts one. So a page's event never calls into the module: it completes the handle of the call in
@@ -244,6 +245,10 @@ export function makeBridge({ events = null, onMessage = () => {}, onAsk = null, 
     closed: () => closed,
     // the end of the bridge, from the page (it goes away): see the header
     close(reason = 'closed by the page') { shut(reason, 'page'); },
+  };
+  // the module's side, which only the adapter gets (attachBridge): not on the page's object, so that only frames the
+  // module really sent register its asks
+  const port = {
     // module -> page (the adapter calls it for `<id>.snd`)
     send(bytes) {
       if (closed !== null) throw new BridgeClosedError(closed);
@@ -276,17 +281,36 @@ export function makeBridge({ events = null, onMessage = () => {}, onAsk = null, 
       stats.parked++;
       return h;
     },
+    // the module opened `<id>.snd` or `<id>.rcv` (see serveFile)
+    serveFile: (kind, io) => serveFile(port, bridge, kind, io),
   };
+  ports.set(bridge, port);
   return bridge;
 }
 
-// The adapters' part (Node's and the browser's spool.mjs): the module opened `<id>.snd` (kind 'bsend') or `<id>.rcv`
-// ('brecv'). `io`: `read()` the request file (`<id>.out` or `<id>.rq`), `answer(text)` the response file, `writeInbox`
-// and `removeInbox` the frames file `<id>.inb`. Throws only when the answer can't be written.
-export function serveBridgeFile(bridge, kind, { read, answer, writeInbox, removeInbox }) {
+// bridge -> the module's side of it, until an adapter takes it
+const ports = new WeakMap();
+
+/**
+ * The module's side of `bridge`, for the adapter that serves its module (Node's and the browser's `wrapWasi` call
+ * it when given `bridge`): `{ send(bytes), startRecv(wait, write), serveFile(kind, io) }`. Once per bridge: a bridge
+ * already attached (to another adapter, or by page code that called this first) throws.
+ */
+export function attachBridge(bridge) {
+  const port = ports.get(bridge);
+  if (port === undefined) throw new Error('wasmhost bridge: not a bridge of makeBridge, or attached to an adapter already');
+  ports.delete(bridge);
+  return port;
+}
+
+// The adapters' part (Node's and the browser's spool.mjs, through their port's serveFile): the module opened
+// `<id>.snd` (kind 'bsend') or `<id>.rcv` ('brecv'). `io`: `read()` the request file (`<id>.out` or `<id>.rq`),
+// `answer(text)` the response file, `writeInbox` and `removeInbox` the frames file `<id>.inb`. Throws only when the
+// answer can't be written.
+function serveFile(port, bridge, kind, { read, answer, writeInbox, removeInbox }) {
   if (kind === 'bsend') {
     let ans = 'ok';
-    try { bridge.send(read()); } catch (err) {
+    try { port.send(read()); } catch (err) {
       ans = err instanceof BridgeClosedError ? `closed: ${err.reason}` : `error: ${errText(err)}`;
     }
     answer(ans);
@@ -294,7 +318,7 @@ export function serveBridgeFile(bridge, kind, { read, answer, writeInbox, remove
   }
   let wait = false;
   try { wait = new TextDecoder().decode(read()) === 'wait'; } catch { /* (a poll) */ }
-  const h = bridge.startRecv(wait, (bytes) => {
+  const h = port.startRecv(wait, (bytes) => {
     // (no partial inbox for the module to read: it is removed when the write fails)
     try { writeInbox(bytes); } catch (err) { try { removeInbox(); } catch { /* (gone) */ } throw err; }
   });

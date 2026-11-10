@@ -40,7 +40,7 @@ import { parseDecompressRequest, formatDecompressAnswer } from '../common/decomp
 import { makeMapper } from './paths.mjs';
 import { perform } from './http.mjs';
 import { decompressFile, errnoOf } from './decompress.mjs';
-import { serveBridgeFile } from '../common/bridge.mjs';
+import { attachBridge } from '../common/bridge.mjs';
 
 export { makeMapper, perform, decompressFile };
 
@@ -96,6 +96,8 @@ export function wrapWasi(wasiImport, { preopens = {}, spool, mode = 'jspi', fetc
   const stats = { requests: 0, decompress: 0, started: 0, batches: 0 };
   if (events != null && mode !== 'jspi') throw new Error("wasmhost: events (a module with tasks) need mode 'jspi'");
   const jobs = checkEvents(events) && makeJobs(events, stats);
+  // (the bridge's module side: this adapter's alone)
+  const port = bridge ? attachBridge(bridge) : null;
 
   // { kind, reqHost, resHost } when the path of this `path_open` is a pending response of the
   // spool, else null
@@ -148,7 +150,7 @@ export function wrapWasi(wasiImport, { preopens = {}, spool, mode = 'jspi', fetc
   // the bridge's two files (no suspension: the module goes on). Throws only when the answer can't be written.
   function bridged(p) {
     const inbHost = p.reqHost.slice(0, -'.rq'.length) + '.inb';
-    serveBridgeFile(bridge, p.kind, {
+    port.serveFile(p.kind, {
       read: () => new Uint8Array(fs.readFileSync(p.reqHost)),
       answer: (text) => fs.writeFileSync(p.resHost, text),
       writeInbox: (bytes) => fs.writeFileSync(inbHost, bytes),

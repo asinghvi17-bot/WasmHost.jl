@@ -39,7 +39,14 @@ wasiInitialize(wasi, inst);
 jt.bind(inst);
 
 const stdout = () => fs.readFileSync(outFile, 'utf8').split('\n').filter((l) => l.length);
-const checks = await s.run({ main: jt.call(inst.exports.main), stdout });
+// (write-fails: the adapter's next write of an inbox file throws, as node:fs would)
+let failInbox = false;
+const writeFileSync = fs.writeFileSync;
+fs.writeFileSync = (file, ...rest) => {
+  if (failInbox && String(file).endsWith('.inb')) { failInbox = false; throw new Error('injected write failure'); }
+  return writeFileSync(file, ...rest);
+};
+const checks = await s.run({ main: jt.call(inst.exports.main), stdout, failInboxWrite: () => { failInbox = true; } });
 for (const l of stdout()) console.log(`stdout: ${l}`);
 console.log(`stats: ${JSON.stringify(s.bridge.stats)}`);
 for (const [what, ok] of checks) console.log(`bridge: ${what}: ${ok}`);

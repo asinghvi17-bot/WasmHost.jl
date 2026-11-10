@@ -636,7 +636,7 @@ end
             @test_skip "$runtime not found"
         else
             out = split(chomp(read(`$node $(joinpath(@__DIR__, "bridge_unit.mjs"))`, String)), '\n')
-            @test length(out) >= 55
+            @test length(out) >= 60
             for l in out
                 @test startswith(l, "ok ")
             end

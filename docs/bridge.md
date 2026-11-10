@@ -41,6 +41,11 @@ bridge.close('page closed');                          // the page goes away
 `makeBridge`, `encodeFrame`, `decodeFrame`, `BridgeClosedError` and `BridgeFullError` are exported
 by `js/node/index.mjs` and `js/browser/index.mjs`.
 
+The page's bridge object has no module side: `send` (the module's messages) and `startRecv` (its
+receives) belong to the port that `attachBridge(bridge)` (`js/common/bridge.mjs`) returns. The
+adapter calls it once in `wrapWasi(..., { bridge })`; a second call (another adapter, or page code
+that took it first) throws. So only frames the module really sent register its asks.
+
 The module needs a task of its own in `serve` for the page's messages and for the answers to its
 asks. A task that asks must not be the serving task: a listener that asks runs the ask with
 `@async`, as WGLMakie's `on(comm)` handler does. A program with no task of its own that waits (a
@@ -54,8 +59,8 @@ the response file makes the adapter do the work, and the open never suspends the
 
 | module writes | then opens | the adapter |
 |---|---|---|
-| `<id>.out`: a frame | `<id>.snd` | `bridge.send(frame)`: decodes it, calls `onMessage` (or `onAsk`), answers `ok`, `error: <message>` (`onMessage` threw) or `closed: <reason>` |
-| `<id>.rq`: `wait` or `poll` | `<id>.rcv` | `bridge.startRecv`: answers a handle (see below), `0` (the frames are in `<id>.inb` already), or a negated WASI errno |
+| `<id>.out`: a frame | `<id>.snd` | its port's `send(frame)`: decodes it, calls `onMessage` (or `onAsk`), answers `ok`, `error: <message>` (`onMessage` threw) or `closed: <reason>` |
+| `<id>.rq`: `wait` or `poll` | `<id>.rcv` | its port's `startRecv`: answers a handle (see below), `0` (the frames are in `<id>.inb` already), or a negated WASI errno |
 
 - **A frame** is `u32le header_length | header | blobs`. The header is JSON. A numeric vector
   is in the blob region (8-byte aligned), and the JSON holds `{"$b": [offset, bytes, "f32"]}` in
@@ -176,6 +181,16 @@ such guard (Node has no page that calls in).
 Re-entrant calls are deliberately not supported. An event is a handle completion of the call in
 flight, and a second call would run Julia code on a runtime that isn't re-entrant (WasmCodegen's
 handlers, the scheduler's task tables).
+
+## Threat model
+
+The page's JavaScript shares the module's origin, and it is trusted: it instantiates the module
+and can call its exports directly. The queue limits, the reply bookkeeping (one exempt answer
+per outstanding ask), and the separate record kind for answers protect against bugs and runaway
+producers: a page that posts faster than the module receives, answers twice, or posts something
+shaped like an answer. They are not a defence against a malicious page, which needs none of the
+bridge to misuse the module. The public API is kept honest (what the page can do with the bridge
+object is what this document says), and nothing beyond that is attempted.
 
 ## Tests
 
