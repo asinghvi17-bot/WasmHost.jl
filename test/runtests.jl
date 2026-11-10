@@ -471,4 +471,103 @@ end
             end
         end
     end
+    @testset "Bridge: codec" begin
+        B = WasmHost.Bridge
+        rt(x) = B.decode(B.encode(x))
+        # plain values: any dictionary, vector or tuple of them
+        @test rt(Dict("x" => 1)) == Dict{String,Any}("x" => 1)
+        @test rt([true, false]) == Any[true, false]
+        @test rt((1, "x")) == Any[1, "x"]
+        @test rt((a = 1.5, b = "s", c = (x = nothing,))) == Dict{String,Any}("a" => 1.5, "b" => "s", "c" => Dict{String,Any}("x" => nothing))
+        @test rt(Dict(:k => [1, 2])) == Dict{String,Any}("k" => Any[1, 2])
+        @test rt(Dict{String,Any}("v" => Any[1, "s", Dict("k" => 2.5), (1.0, 2.0), :sym, 'c', nothing])) ==
+              Dict{String,Any}("v" => Any[1, "s", Dict{String,Any}("k" => 2.5), Any[1.0, 2.0], "sym", "c", nothing])
+        @test rt(1:3) == Any[1, 2, 3]
+        @test rt("é\n\"q\"\t\u0001") == "é\n\"q\"\t\u0001"
+        @test rt(Float16(1.5)) === 1.5 && rt(NaN) === nothing && rt(UInt8(7)) === 7
+        # numeric vectors are blobs (typed arrays on the page), views and ranges of them too
+        @test rt(Float32[1, 2.5]) == Float32[1, 2.5] && rt(Float32[1, 2.5]) isa Vector{Float32}
+        @test rt(view(Int32[1, 2, 3], 2:3)) == Int32[2, 3] && rt(view(Int32[1, 2, 3], 2:3)) isa Vector{Int32}
+        @test rt(Dict{String,Any}("a" => UInt16[1, 2], "b" => Float64[])) == Dict{String,Any}("a" => UInt16[1, 2], "b" => Float64[])
+        # what it can't take: a BridgeError
+        @test_throws B.BridgeError B.encode(Dict(1 => 2))
+        @test_throws B.BridgeError B.encode(1 + 2im)
+        @test_throws B.BridgeError B.encode(Any[1 + 2im])
+        @test_throws B.BridgeError B.decode(UInt8[1, 0])
+        @test_throws B.BridgeError B.split_frames(UInt8[5, 0, 0, 0, 1])
+    end
+
+    @testset "Bridge: without a host" begin
+        B = WasmHost.Bridge
+        withenv(NOSPOOL...) do
+            @test !B.available()
+            @test B.send(Dict("x" => 1)) == false
+            @test_throws B.BridgeError B.recv()
+        end
+        mktempdir() do dir
+            withenv("WASMHOST_SPOOL" => dir) do
+                # (a spool directory, no adapter: nothing answers)
+                @test B.send((x = 1,)) == false
+                @test_throws B.BridgeError B.recv()
+                @test isempty(readdir(dir))
+            end
+        end
+        # an answer to an ask nobody made, a second answer: dropped
+        ch = Channel{Any}(1)
+        B.PENDING[99] = ch
+        B.deliver_reply!(Dict{String,Any}("bridge_reply" => 99, "value" => 1))
+        B.deliver_reply!(Dict{String,Any}("bridge_reply" => 99, "value" => 2))
+        B.deliver_reply!(Dict{String,Any}("bridge_reply" => 98, "value" => 3))
+        @test take!(ch) == 1 && !isready(ch)
+        B.deliver_reply!(Dict{String,Any}("bridge_reply" => 99, "error" => "no such op"))
+        r = take!(ch)
+        @test r isa B.Failed && r.err isa B.AskError && r.err.msg == "no such op"
+        delete!(B.PENDING, 99)
+    end
+
+    @testset "JavaScript: bridge codec round trip" begin
+        if node === nothing
+            @test_skip "$runtime not found"
+        else
+            B = WasmHost.Bridge
+            v = (s = "é\n\"q\"", d = Dict("x" => 1), b = [true, false], t = (1, "x"), f = Float32[1, 2.5], i = Int32[-1, 7],
+                 n = nothing, nested = Dict{String,Any}("v" => Any[1.5, "s"]))
+            script = """
+            import fs from 'node:fs';
+            import { encodeFrame, decodeFrame } from $(js("common", "bridge.mjs"));
+            const v = decodeFrame(fs.readFileSync(process.argv[1]));
+            const ok = v.s === 'é\\n"q"' && v.d.x === 1 && v.b[0] === true && v.b[1] === false && v.t[0] === 1 && v.t[1] === 'x' &&
+                       v.f instanceof Float32Array && v.f[1] === 2.5 && v.i instanceof Int32Array && v.i[0] === -1 && v.n === null &&
+                       v.nested.v[0] === 1.5;
+            v.back = new Float64Array([0.25, -3]);
+            v.big = 2n ** 40n;
+            fs.writeFileSync(process.argv[2], encodeFrame(v));
+            process.stdout.write(ok ? 'decoded' : 'WRONG ' + JSON.stringify(v));
+            """
+            mktempdir() do dir
+                a, b = joinpath(dir, "a"), joinpath(dir, "b")
+                write(a, B.encode(v))
+                @test read(`$node --input-type=module -e $script $a $b`, String) == "decoded"
+                w = B.decode(read(b))
+                @test w["s"] == v.s && w["d"] == Dict{String,Any}("x" => 1) && w["t"] == Any[1, "x"]
+                @test w["f"] == Float32[1, 2.5] && w["f"] isa Vector{Float32} && w["i"] == Int32[-1, 7]
+                @test w["back"] == [0.25, -3.0] && w["back"] isa Vector{Float64} && w["big"] == 2^40
+            end
+        end
+    end
+
+    # js/common/bridge.mjs on its own (test/bridge_unit.mjs): a write that throws (the module's receive is not
+    # stranded, the frames stay queued), the queue's capacity and overflow, bounded chunks, closing from either side,
+    # the answers of asks, the adapters' files
+    @testset "JavaScript: bridge queue, failures, close" begin
+        if node === nothing
+            @test_skip "$runtime not found"
+        else
+            out = split(chomp(read(`$node $(joinpath(@__DIR__, "bridge_unit.mjs"))`, String)), '\n')
+            @test length(out) >= 36
+            for l in out
+                @test startswith(l, "ok ")
+            end
+        end
+    end
 end
