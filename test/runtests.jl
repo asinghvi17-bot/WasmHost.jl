@@ -489,6 +489,14 @@ end
         @test rt(Float32[1, 2.5]) == Float32[1, 2.5] && rt(Float32[1, 2.5]) isa Vector{Float32}
         @test rt(view(Int32[1, 2, 3], 2:3)) == Int32[2, 3] && rt(view(Int32[1, 2, 3], 2:3)) isa Vector{Int32}
         @test rt(Dict{String,Any}("a" => UInt16[1, 2], "b" => Float64[])) == Dict{String,Any}("a" => UInt16[1, 2], "b" => Float64[])
+        # empty numeric vectors (a frame whose blobs are all empty has no blob region), alone and with others
+        for T in (Float32, Float64, UInt8, Int8, Int16, UInt16, Int32, UInt32)
+            @test rt(T[]) == T[] && rt(T[]) isa Vector{T}
+            @test rt(Dict{String,Any}("e" => T[])) == Dict{String,Any}("e" => T[])
+        end
+        m = rt(Any[Float32[], Float64[1.5, -2], Int8[], UInt16[7], Int32[]])
+        @test m == Any[Float32[], [1.5, -2.0], Int8[], UInt16[7], Int32[]] && m[1] isa Vector{Float32} && m[5] isa Vector{Int32}
+        @test_throws B.BridgeError B.decode(UInt8[18, 0, 0, 0, codeunits("{\"\$b\":[0,4,\"f32\"]}")...])
         # what it can't take: a BridgeError
         @test_throws B.BridgeError B.encode(Dict(1 => 2))
         @test_throws B.BridgeError B.encode(1 + 2im)
@@ -571,6 +579,42 @@ end
         end
     end
 
+    @testset "JavaScript: bridge codec, empty vectors" begin
+        if node === nothing
+            @test_skip "$runtime not found"
+        else
+            B = WasmHost.Bridge
+            types = (Float32, Float64, UInt8, Int8, Int16, UInt16, Int32, UInt32)
+            # each type alone (a frame without a blob region), and all of them mixed with non-empty ones
+            cases = Any[T[] for T in types]
+            push!(cases, Dict{String,Any}("e" => Float32[], "f" => Float64[1.5, -2], "g" => Int8[], "h" => UInt16[7], "i" => UInt32[]))
+            script = """
+            import fs from 'node:fs';
+            import { encodeFrame, decodeFrame } from $(js("common", "bridge.mjs"));
+            const out = [];
+            for (const f of process.argv.slice(1)) {
+              const v = decodeFrame(fs.readFileSync(f));
+              out.push(ArrayBuffer.isView(v) ? `\${v.constructor.name}:\${v.length}` : Object.keys(v).sort().map((k) => `\${k}=\${v[k].constructor.name}:\${Array.from(v[k]).join('|')}`).join(','));
+              fs.writeFileSync(f + '.back', encodeFrame(v));
+            }
+            process.stdout.write(out.join(' '));
+            """
+            mktempdir() do dir
+                files = [joinpath(dir, string(i)) for i in eachindex(cases)]
+                foreach((f, c) -> write(f, B.encode(c)), files, cases)
+                got = split(read(`$node --input-type=module -e $script $files`, String), ' ')
+                @test got[1:8] == ["Float32Array:0", "Float64Array:0", "Uint8Array:0", "Int8Array:0", "Int16Array:0",
+                                   "Uint16Array:0", "Int32Array:0", "Uint32Array:0"]
+                @test got[9] == "e=Float32Array:,f=Float64Array:1.5|-2,g=Int8Array:,h=Uint16Array:7,i=Uint32Array:"
+                for (f, c) in zip(files, cases)
+                    back = B.decode(read(f * ".back"))
+                    @test back == c && typeof(back) == (c isa Vector ? typeof(c) : Dict{String,Any})
+                end
+                @test B.decode(read(files[end] * ".back"))["e"] isa Vector{Float32}
+            end
+        end
+    end
+
     # js/common/bridge.mjs on its own (test/bridge_unit.mjs): a write that throws (the module's receive is not
     # stranded, the frames stay queued), the queue's capacity and overflow, bounded chunks, closing from either side,
     # the answers of asks, the adapters' files
@@ -579,7 +623,7 @@ end
             @test_skip "$runtime not found"
         else
             out = split(chomp(read(`$node $(joinpath(@__DIR__, "bridge_unit.mjs"))`, String)), '\n')
-            @test length(out) >= 40
+            @test length(out) >= 52
             for l in out
                 @test startswith(l, "ok ")
             end

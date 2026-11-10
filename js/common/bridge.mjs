@@ -21,8 +21,9 @@
 //   `Bridge.serve` fails on it and closes the bridge, which drops them).
 // - The queue is bounded (`capacity` frames, `maxBytes` bytes). When it is full, `overflow: 'reject'` (the default)
 //   makes `post` throw a BridgeFullError and queue nothing (the page's backpressure: `room()` says how much fits);
-//   `'drop-oldest'` drops the oldest frames to make room (for events that only matter as the latest state). Replies
-//   to the module's asks are always queued (the module's asks bound them). One receive takes at most `chunkBytes`
+//   `'drop-oldest'` drops the oldest frames to make room (for events that only matter as the latest state). The
+//   first reply to each outstanding ask of the module is always queued (the module's asks bound them); `reply`
+//   refuses (`false`) any other: an id not asked, or answered already. One receive takes at most `chunkBytes`
 //   of frames (at least one frame); the rest is there at once for the next.
 // - Closing: `bridge.close(reason)` (the page goes away) drops the queue, fails a parked receive and every later one
 //   (the module's `recv` throws a BridgeClosedError, its pending asks too), and makes `post` throw a
@@ -83,7 +84,9 @@ export function decodeFrame(bytes) {
         const [off, n, tag] = ref;
         const C = ARRAYS[tag];
         if (!C) throw new Error(`wasmhost bridge: unknown blob type ${tag}`);
-        if (!(off >= 0 && n >= 0 && blobStart + off + n <= b.length && n % C.BYTES_PER_ELEMENT === 0))
+        // (an empty blob is empty wherever it points: a frame whose blobs are all empty has no blob region)
+        if (n === 0 && Number.isInteger(off) && off >= 0) return new C(0);
+        if (!(Number.isInteger(off) && Number.isInteger(n) && off >= 0 && n >= 0 && blobStart + off + n <= b.length && n % C.BYTES_PER_ELEMENT === 0))
           throw new Error('wasmhost bridge: a blob out of range');
         // (a copy of exactly its bytes: aligned, and the frame's memory is not kept; not `slice`, which is a view
         // of the pool for a Node Buffer)
@@ -122,7 +125,11 @@ export function makeBridge({ events = null, onMessage = () => {}, onAsk = null, 
   let closed = null;           // why the bridge closed, once it has
   // (posted: frames queued; sent: frames of the module; delivered: frames taken by the module, in `receives` writes;
   // parked: receives that waited; dropped, refused: frames of a full queue (overflow), or dropped by a close)
-  const stats = { posted: 0, sent: 0, delivered: 0, receives: 0, parked: 0, dropped: 0, refused: 0, writeErrors: 0 };
+  // (strayReplies: replies to an id the module isn't waiting for, or answered already: not queued)
+  const stats = { posted: 0, sent: 0, delivered: 0, receives: 0, parked: 0, dropped: 0, refused: 0, writeErrors: 0, strayReplies: 0 };
+  // the ids of the module's asks that the page has not answered yet: a reply to one of them is exempt from the
+  // queue's limits, once (the module's asks bound them); any other is refused
+  const outstanding = new Set();
 
   function enqueue(frame, isReply, anySize = false) {
     if (closed !== null) throw new BridgeClosedError(closed);
@@ -186,6 +193,7 @@ export function makeBridge({ events = null, onMessage = () => {}, onAsk = null, 
     stats.dropped += inbox.length;
     inbox.length = 0;
     queued = counted = total = 0;
+    outstanding.clear();
     if (waiting !== null) { const w = waiting; waiting = null; events.ready(w.h, CLOSED_PREFIX + closed); }
     try { onClose(closed, by); } catch { /* (the page's callback: not the module's error) */ }
     return true;
@@ -205,10 +213,14 @@ export function makeBridge({ events = null, onMessage = () => {}, onAsk = null, 
     // page -> module: queue `value`; a pending recv of the module is completed. Throws a BridgeClosedError once
     // closed, a BridgeFullError when it does not fit (overflow 'reject')
     post(value) { enqueue(encodeFrame(value), false); },
-    // the answer to the module's `Bridge.ask` of id `id`: a value, or a promise of one; a rejection is the ask's error
+    // the answer to the module's `Bridge.ask` of id `id`: a value, or a promise of one; a rejection is the ask's
+    // error. `true` when it is taken; `false` (nothing queued, stats.strayReplies) for an id the module did not ask,
+    // or asked and has been answered (the first reply is the answer), or on a closed bridge
     reply(id, answer) {
+      if (!outstanding.delete(id)) { stats.strayReplies++; return false; }
       Promise.resolve(answer).then((value) => postReply(id, { bridge_reply: id, value }),
                                    (err) => postReply(id, { bridge_reply: id, error: errText(err) }));
+      return true;
     },
     // frames waiting for the module, and their bytes
     pending: () => inbox.length,
@@ -227,12 +239,14 @@ export function makeBridge({ events = null, onMessage = () => {}, onAsk = null, 
       const value = decodeFrame(bytes);
       stats.sent++;
       if (value !== null && typeof value === 'object' && typeof value.bridge_close === 'string') { shut(value.bridge_close, 'module'); return; }
-      if (onAsk && value !== null && typeof value === 'object' && Number.isInteger(value.bridge_ask)) {
-        const id = value.bridge_ask;
-        bridge.reply(id, new Promise((resolve) => resolve(onAsk(value, bytes))));
+      const ask = value !== null && typeof value === 'object' && Number.isInteger(value.bridge_ask) ? value.bridge_ask : null;
+      if (ask !== null) outstanding.add(ask);
+      if (ask !== null && onAsk) {
+        bridge.reply(ask, new Promise((resolve) => resolve(onAsk(value, bytes))));
         return;
       }
-      onMessage(value, bytes);
+      // (an ask that onMessage threw for is the module's send error: its ask ends, nothing will answer it)
+      try { onMessage(value, bytes); } catch (err) { if (ask !== null) outstanding.delete(ask); throw err; }
     },
     // the adapter calls it for `<id>.rcv`: the handle for `<id>.rcv` (0: `write` was called with the frames) or a
     // negative errno (EPIPE: closed; EBUSY: a receive is pending; EIO: `write` threw, the frames stay queued)

@@ -121,9 +121,11 @@ const tick = () => new Promise((r) => setTimeout(r, 0));
   check('ask: a throw is an error answer', by(3)?.error === 'bad op');
   const c = makeBridge({ events, capacity: 1 });
   c.post({ fill: 1 });
+  c.send(encodeFrame({ bridge_ask: 7 }));   // (no onAsk: the page answers from onMessage)
   c.reply(7, 42);
   await tick();
   check('ask: a reply goes even when the queue is full', c.pending() === 2);
+  c.send(encodeFrame({ bridge_ask: 8 }));
   c.close('x');
   c.reply(8, 1);
   await tick();
@@ -149,6 +151,7 @@ const tick = () => new Promise((r) => setTimeout(r, 0));
 // a closed bridge's receive answer carries the page's reason
 {
   const d = makeBridge({ events, capacity: 2, overflow: 'drop-oldest' });
+  d.send(encodeFrame({ bridge_ask: 1 }));
   d.reply(1, 'picked');
   await tick();
   for (let i = 0; i < 5; i++) d.post({ i });
@@ -159,6 +162,7 @@ const tick = () => new Promise((r) => setTimeout(r, 0));
   const unhandled = [];
   const onRej = (e) => unhandled.push(e);
   process.on('unhandledRejection', onRej);
+  m.send(encodeFrame({ bridge_ask: 2 }));
   m.reply(2, 'x'.repeat(200));
   await tick(); await tick();
   process.off('unhandledRejection', onRej);
@@ -171,4 +175,45 @@ const tick = () => new Promise((r) => setTimeout(r, 0));
   const files = {};
   serveBridgeFile(b, 'brecv', { read: () => new TextEncoder().encode('wait'), answer: (t) => { files.res = t; }, writeInbox: () => {}, removeInbox: () => {} });
   check('brecv on a closed bridge: -EPIPE and the reason', files.res === '-64\npage gone');
+}
+
+// replies only to outstanding asks, once (the re-review: 1000 replies to one id queued 1000 exempt frames)
+{
+  const b = makeBridge({ events, capacity: 1, maxBytes: 128 });
+  b.send(encodeFrame({ bridge_ask: 5, op: 'pick' }));
+  const results = [];
+  for (let i = 0; i < 1000; i++) results.push(b.reply(5, i));
+  await tick(); await tick();
+  check('reply: the first to an outstanding ask is taken, the others refused (false)', results[0] === true && results.slice(1).every((r) => r === false));
+  check('reply: one frame queued, the first answer', b.pending() === 1 && b.stats.strayReplies === 999);
+  check('reply: to an id never asked: false, nothing queued', b.reply(6, 1) === false && b.pending() === 1);
+  check('reply: room() of the page\'s own posts unchanged', b.room().frames === 1 && b.room().bytes === 128);
+  let got = null;
+  b.startRecv(true, (bytes) => { got = frames(bytes); });
+  check('reply: the module gets the first answer only', JSON.stringify(got) === '[{"bridge_reply":5,"value":0}]');
+  check('reply: after the answer was taken, still refused', b.reply(5, 1) === false && b.pending() === 0);
+  // with onAsk the bridge answers itself: the page's own reply to that id is a duplicate
+  const a = makeBridge({ events, onAsk: () => 'auto' });
+  a.send(encodeFrame({ bridge_ask: 9 }));
+  check('reply: with onAsk, a second reply by hand is refused', a.reply(9, 'manual') === false);
+  // an ask whose onMessage threw is not outstanding (the module's send failed, its ask ended)
+  const t = makeBridge({ events, onMessage: () => { throw new Error('page bug'); } });
+  try { t.send(encodeFrame({ bridge_ask: 3 })); } catch { /* (the module's send error) */ }
+  check('reply: to an ask onMessage threw for: refused', t.reply(3, 1) === false);
+}
+
+// empty typed arrays (the re-review: a frame whose only blob is empty has no blob region)
+{
+  const kinds = [Float32Array, Float64Array, Uint8Array, Int8Array, Int16Array, Uint16Array, Int32Array, Uint32Array];
+  check('empty typed arrays of each kind round-trip', kinds.every((C) => { const v = decodeFrame(encodeFrame({ a: new C(0) })).a; return v instanceof C && v.length === 0; }));
+  const mixed = decodeFrame(encodeFrame({ e: new Float32Array(0), f: new Float64Array([1.5, -2]), g: new Int8Array(0), h: new Uint16Array([7]) }));
+  check('empty and non-empty typed arrays together', mixed.e.length === 0 && mixed.g.length === 0 && Array.from(mixed.f).join() === '1.5,-2' && mixed.h[0] === 7);
+  // an empty blob pointing past the end of a frame (what Julia's encoder makes for Float32[] alone)
+  const header = new TextEncoder().encode('{"$b":[0,0,"f32"]}');
+  const frame = new Uint8Array(4 + header.length);
+  new DataView(frame.buffer).setUint32(0, header.length, true);
+  frame.set(header, 4);
+  const v = decodeFrame(frame);
+  check('an empty blob at the end of a frame without a blob region', v instanceof Float32Array && v.length === 0);
+  check('a non-empty blob out of range still throws', errName(() => { const h = new TextEncoder().encode('{"$b":[0,4,"f32"]}'); const f = new Uint8Array(4 + h.length); new DataView(f.buffer).setUint32(0, h.length, true); f.set(h, 4); decodeFrame(f); }) === 'Error');
 }

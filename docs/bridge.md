@@ -59,8 +59,10 @@ the response file makes the adapter do the work, and the open never suspends the
 
 - **A frame** is `u32le header_length | header | blobs`. The header is JSON. A numeric vector
   is in the blob region (8-byte aligned), and the JSON holds `{"$b": [offset, bytes, "f32"]}` in
-  its place: a typed array on the page (tags `f32 f64 u8 i8 i16 u16 i32 u32`). `NaN` and `±Inf`
-  are `null`.
+  its place: a typed array on the page (tags `f32 f64 u8 i8 i16 u16 i32 u32`). A frame without
+  blob bytes has no blob region (no padding after the header), so an empty blob (`bytes` 0) may
+  point at or past the frame's end: decoders take it as an empty array wherever it points.
+  `NaN` and `±Inf` are `null`.
 - **The inbox**, `<id>.inb`: `u32le length | frame`, repeated, in the order the page posted.
 - **A waiting receive** with nothing queued gets an external `julia_io` handle. The module
   waits for it (`Runtime.Host.await_handle`: with tasks, the task is parked and the others run),
@@ -117,8 +119,13 @@ this with `verify = :error`.
 - **`serve`** returns when `f` returns `false` or the bridge is closed, and rethrows an error of
   `f` or of a receive. Either way it closes the bridge first, so no ask waits for ever.
 - **An ask's error:** the page's `onAsk` threw or rejected (or `bridge.reply(id, promise)`
-  rejected), which is `{"bridge_reply": id, "error": message}`, an `AskError` in the module. An
-  answer to an unknown or finished ask, or a second answer, is dropped.
+  rejected), which is `{"bridge_reply": id, "error": message}`, an `AskError` in the module.
+- **`bridge.reply(id, answer)`** returns `true` when it takes the answer. It returns `false`, and
+  queues nothing (`stats.strayReplies`), for an id the module isn't waiting for: never asked,
+  answered already (the first reply is the answer; with `onAsk` the bridge answers itself), an ask
+  `onMessage` threw for, or a closed bridge. The page's side knows the outstanding ids because
+  the asks arrive through `send`. In the module, an answer to an unknown or finished ask is
+  dropped too.
 - **`send`** returns `false` when no adapter bridge took the frame. It throws a `BridgeError`
   when the page's `onMessage` threw, and a `BridgeClosedError` when the bridge is closed.
 - **A write that fails** (the adapter could not write `<id>.inb`) leaves the frames queued and
@@ -138,8 +145,11 @@ frames and `maxBytes` bytes. When it is full:
 - `overflow: 'drop-oldest'`: the oldest frames are dropped to make room (`stats.dropped`). Use
   it for events that only matter as the latest state (mouse moves).
 
-A frame larger than `maxBytes` always throws. Answers to the module's asks are always queued and
-never dropped, and they don't count towards the limits (the module's asks bound them). An answer
+A frame larger than `maxBytes` always throws. The answer to each of the module's asks is always
+queued and never dropped, and it doesn't count towards the limits: the bridge exempts one reply
+per outstanding ask, so the module's asks bound them. A second reply, or one to an id that wasn't
+asked, is refused (`reply` returns `false`). A raw `post` of a `bridge_reply` object is an
+ordinary post, counted and limited like any other. An answer
 larger than `maxBytes`, or one that can't be encoded, becomes the ask's error answer. A `post` of
 something that isn't JSON (`undefined`, a function) throws. One receive takes at most `chunkBytes` of frames (at least one frame),
 so the module never reads one huge inbox. The rest is there at once for its next receive. After

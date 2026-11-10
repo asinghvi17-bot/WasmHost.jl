@@ -494,7 +494,8 @@ end
 
 function read_blob(p::Parser, off::Int, nbytes::Int, tag::String)::Any
     start = p.blobs + off
-    (start >= 0 && nbytes >= 0 && start + nbytes <= length(p.bytes)) || parse_error(p, "blob out of range")
+    # (an empty blob is empty wherever it points: a frame whose blobs are all empty has no blob region)
+    (off >= 0 && nbytes >= 0 && (nbytes == 0 || start + nbytes <= length(p.bytes))) || parse_error(p, "blob out of range")
     tag == "f32" && return blob_vector(Float32, p.bytes, start, nbytes)
     tag == "f64" && return blob_vector(Float64, p.bytes, start, nbytes)
     tag == "u8" && return blob_vector(UInt8, p.bytes, start, nbytes)
