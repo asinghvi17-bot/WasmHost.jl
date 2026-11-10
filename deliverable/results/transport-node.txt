@@ -1,8 +1,0 @@
-R {"flag":true,"none":null,"type":"hello","msg":"from julia é\n\"q\"","x":1.5}
-R {"type":"pong","n":1,"echo":"café","sum":6.5,"arr":{"Int32Array":[1,2,3]}}
-R {"type":"pong","n":2,"echo":null,"sum":16.5,"arr":{"Int32Array":[1,2,3]}}
-R {"type":"pong","n":3,"echo":"second","sum":36.5,"arr":{"Int32Array":[1,2,3]}}
-R {"type":"bye","pings":3}
-R done 3 36.5
-R main returned 0 after 85 ms; posted 4, sent 5, parked 2
-stats {"posted":4,"sent":5,"delivered":4,"parked":2} pending 0

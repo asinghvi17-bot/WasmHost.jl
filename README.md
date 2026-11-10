@@ -122,35 +122,46 @@ Measured (test/e2e, 14 requests to a local server with 50 ms latency; sequential
 
 ## Bridge
 
-A message channel for a program that has to talk to its page after it started (protocol `wasm-bridge 1`; design and
-evidence in [`deliverable/NOTES.md`](deliverable/NOTES.md)). Plain Julia on the module's side:
+A message channel for a program that has to talk to its page after it started (protocol `wasm-bridge 1`). The
+protocol, the codec, the lifecycle, the page's queue and the limitations are in [`docs/bridge.md`](docs/bridge.md).
+Plain Julia on the module's side:
 
 ```julia
 const B = WasmHost.Bridge
-B.send(Dict{String,Any}("msg_type" => "2", "payload" => payload))     # module -> page, never suspends
-t = @async B.serve(msg -> handle(msg))                                 # page -> module: parked while there are none
-answer = B.ask(request)                                                # send, and park until {"bridge_reply": id, "value": v}
+B.send(Dict("msg_type" => "2", "payload" => payload))       # module -> page, never suspends
+t = @async B.serve(msg -> handle(msg))                      # page -> module: parked while there are none
+answer = B.ask(request)                                     # send, park until the page answers (or AskError)
+B.close("done")                                             # pending asks and a parked recv end: BridgeClosedError
 ```
 
 ```js
-const bridge = makeBridge({ events, onMessage: (value) => ... });      // js/common/bridge.mjs; events: the julia_io events
-const host = wrapWasi(..., { events, bridge });                        // Node or browser adapter
-bridge.post({ msg_type: '0', id: obsId, payload });                    // page -> module (from any DOM event handler)
+const bridge = makeBridge({ events, onMessage: (value) => ..., onAsk: async (request) => answer,
+                            onClose: (reason, by) => ... });   // js/common/bridge.mjs; events: the julia_io events
+const host = wrapWasi(..., { events, bridge });                 // Node or browser adapter
+bridge.post({ msg_type: '0', id: obsId, payload });             // page -> module (from any DOM event handler)
+bridge.close('page closed');                                    // the page goes away
 ```
 
 - **Page to module is a handle, not a call.** The module's `recv` gets a `julia_io` external handle (like a request of the
   concurrent downloads); `bridge.post` makes it ready, and the task that waits for it (`Runtime.Host.await_handle`)
-  runs. The page never calls into the module for an event, so the one-call-at-a-time rule of the browser adapter stays.
-  Events posted while the module is not parked wait in the bridge's queue for its next `recv`
-  (`Bridge.recv(wait = false)` / `Bridge.drain(f)` takes them without `julia_io` events, e.g. at the start of an export).
-- **Frames:** `u32le header_length | header (JSON) | blobs`; numeric vectors are typed arrays on the page
-  (`{"$b": [offset, bytes, "f32"]}`). `Bridge.encode`/`decode` are the codec, with `isa` branches on concrete types so
-  that a trimmed module resolves every call (a `Pair` or a `string` of an `Any` value is not trim-safe).
+  runs. The page never calls into the module for an event, so the one-call-at-a-time rule of the browser adapter stays;
+  a bridge send or receive while the module is suspended (a direct, re-entrant call) is refused and poisons the
+  instance. Events posted while the module is not parked wait in the bridge's bounded queue (`capacity`, `maxBytes`;
+  `overflow: 'reject'` or `'drop-oldest'`) for its next `recv` (`Bridge.recv(wait = false)` / `Bridge.drain(f)` takes
+  them without `julia_io` events, e.g. at the start of an export).
+- **Values:** `Bridge.encode`/`decode` are the codec: `nothing`, numbers, strings, symbols, any vector, tuple, named tuple
+  or string-keyed dictionary of them (`Dict("x" => 1)`, `[true, false]`, `(1, "x")`); numeric vectors are typed arrays on
+  the page. Trim-safe by dispatch on the containers' element types; a value typed `Any` goes through a closed list.
+- **The end:** `Bridge.close`, `serve` ending (or failing) or the page's `bridge.close` closes the bridge: pending asks,
+  a parked `recv` and every later call throw a `BridgeClosedError`; a page's rejected answer is an `AskError`.
 - Needs the `WasmHostBridgeExt` extension (loaded with WasmCodegen) for the wait, and `Config(tasks = :jspi,
   host_extensions = [:julia_io])` for a task that waits while others run.
-- Tests: `test/e2e/brprog.jl` (transport), `test/e2e/mprog.jl` (Makie: `connect_scene_events!`,
-  `on(events(scene).mousebutton)`, an evaljs-style message, a pick), built by `build_bridge.jl`/`build_makie.jl`
-  (`verify = :error`) and run by `brun.mjs`, `mrun.mjs` (Node) and `browser/mrun.mjs` (headless Chromium).
+- Tests: `Pkg.test()` (the codec, `js/common/bridge.mjs` on its own) and `test/e2e/e2e.jl WASMCODEGEN bridge` in Node
+  and headless Chromium (`test/e2e/brprog.jl`, strict `verify = :error`: every case asserted). The Makie example
+  (`test/e2e/mprog.jl`: WGLMakie's own `connect_scene_events!`, `on(events(scene).mousebutton)`, a pick) is the opt-in
+  `makie` part: it needs Makie with the WGLMakie typed window-events patch,
+  [`test/e2e/patches/0001-WGLMakie-typed-window-events.patch`](test/e2e/patches/0001-WGLMakie-typed-window-events.patch),
+  and WasmCompat (see [`docs/bridge.md`](docs/bridge.md#makie-and-bonito)).
 
 ## Decompress
 

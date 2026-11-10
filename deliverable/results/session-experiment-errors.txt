@@ -1,2 +1,0 @@
-WasmValidationError in function __unpack_any_13_533 at instruction 1880 (f32_shr_u): unknown instruction
-  operand stack: [F32, F32]

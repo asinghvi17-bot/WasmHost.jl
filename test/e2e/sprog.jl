@@ -1,7 +1,7 @@
 # EXPERIMENT (design question 2): Bonito's own Session in a Wasm module, with a connection that hands the bytes of
 # Bonito's wire format to WasmHost.Bridge. `evaljs` on it, and an UpdateObservable coming back through `process_message`
 # (the entry Bonito has for an already decoded frame). Compiled with verify = :warn to list what in Bonito does not
-# compile as it is; the overlays below are the ones the first rounds needed. See deliverable/NOTES.md.
+# compile as it is; the overlays below are the ones the first rounds needed. See docs/bridge.md (Makie and Bonito).
 module SessionProg
 using Bonito, Observables, WasmHost, WasmCodegen, UUIDs
 using Bonito: @js_str
