@@ -49,19 +49,28 @@ export function isPoisoned(instance) { return poisoned.has(instance); }
 function poison(wasi, cause) {
   if (poisoned.has(wasi)) return;
   poisoned.set(wasi, cause);
-  if (wasi.inst) poisoned.set(wasi.inst, cause);
+  if (!wasi.inst) return;
+  poisoned.set(wasi.inst, cause);
+  // the calls still queued behind the one in flight reject now, not when that one settles (it may be stalled for good)
+  const state = calls.get(wasi.inst);
+  for (const entry of state?.waiting ?? []) entry.args = null, entry.reject(poisonedError(wasi.inst, `${entry.name} not run`));
 }
 
 // throws an InstancePoisonedError (what: what it stops) if `key` (an instance or a WASI instance) is poisoned
 function checkPoisoned(key, what) {
-  if (!poisoned.has(key)) return;
+  if (poisoned.has(key)) throw poisonedError(key, what);
+}
+
+function poisonedError(key, what) {
   const cause = poisoned.get(key);
-  throw new InstancePoisonedError(
+  return new InstancePoisonedError(
     `wasmhost: ${what}: the module instance is poisoned, as it was called again while a request of it was in flight, ` +
     `which cannot be unwound safely; make a new instance (${cause.message})`, { cause });
 }
 
-// per instance: the export in flight (or queued) and the tail of the queue
+// per instance: the export in flight (or queued), the tail of the queue, and the queued calls that haven't started
+// (`waiting`: { name, args, reject }, for poisoning to reject at once and drop their arguments: the step chained on
+// `tail` can't be unlinked, and stays until the call in flight settles, which may be never)
 const calls = new WeakMap();
 
 /**
@@ -79,7 +88,7 @@ const calls = new WeakMap();
  */
 export function promisingExports(instance, { whenBusy = 'queue', tasks } = {}) {
   if (whenBusy !== 'queue' && whenBusy !== 'reject') throw new Error(`wasmhost: whenBusy ${whenBusy}: 'queue' or 'reject'`);
-  if (!calls.has(instance)) calls.set(instance, { pending: 0, current: null, tail: Promise.resolve() });
+  if (!calls.has(instance)) calls.set(instance, { pending: 0, current: null, tail: Promise.resolve(), waiting: new Set() });
   const state = calls.get(instance);
   const out = {};
   for (const [name, f] of Object.entries(instance.exports)) {
@@ -93,10 +102,17 @@ export function promisingExports(instance, { whenBusy = 'queue', tasks } = {}) {
         return Promise.reject(new ReentryError(`wasmhost: ${name} called while ${state.current ?? 'another export'} is in flight (one call at a time per module)`));
       if (state.pending++ === 0) state.current = name;
       // (poisoned while it waited in the queue, or while it ran: whatever it returns is not to be trusted)
-      const run = state.tail.then(() => { checkPoisoned(instance, `${name} not run`); state.current = name; return p(...args); })
+      const entry = { name, args, reject: null };
+      const turn = new Promise((_, reject) => { entry.reject = reject; });
+      state.waiting.add(entry);
+      const run = Promise.race([turn, state.tail.then(() => {
+          // (rejected by poisoning while it waited, so already settled: it never runs)
+          if (!state.waiting.delete(entry)) return;
+          const { args } = entry; entry.args = null;
+          checkPoisoned(instance, `${name} not run`); state.current = name; return p(...args); })])
         .then((result) => { checkPoisoned(instance, `${name} abandoned`); return result; },
               (err) => { if (!(err instanceof InstancePoisonedError)) checkPoisoned(instance, `${name} abandoned`); throw err; })
-        .finally(() => { state.pending--; state.current = null; });
+        .finally(() => { state.waiting.delete(entry); state.pending--; state.current = null; });
       state.tail = run.catch(() => {});
       return run;
     };

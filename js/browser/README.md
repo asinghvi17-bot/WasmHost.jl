@@ -115,7 +115,9 @@ await exports.main();
   re-entrant call fails with the `ReentryError`; the suspended export rejects with an
   `InstancePoisonedError` (`cause`: the `ReentryError`) when it would resume, and returns no
   result; and every later call through `promisingExports` rejects at once with an
-  `InstancePoisonedError`, the ones queued included, as does every later host request.
+  `InstancePoisonedError`, as does every later host request; the calls already queued reject at
+  once, when the instance is poisoned, not when the request in flight settles (it may be stalled
+  for good).
   `isPoisoned(instance)` tells. Nothing repairs a poisoned instance: **recovery is a new
   instance** (instantiate the module again, with a new WASI instance and adapter, the same
   compiled `WebAssembly.Module`). Only a call that needs the host is caught: a re-entrant call
@@ -165,7 +167,9 @@ WASM_RUNTIME=chromium julia test/e2e/e2e.jl /path/to/WasmCodegen.jl all
   on the raw export while `main` waits for its first request): the re-entrant call must fail
   with a `ReentryError`, the suspended `main` and a queued one must reject with an
   `InstancePoisonedError` (neither returns a result, the queued one never runs), and so must
-  every call after. The queue is checked with a hand-assembled module too: an export that traps
+  every call after. The same with the first request held open (a stalled `fetch`) and a call
+  queued before the re-entry: it must reject while the request is still stalled; and a new WASI
+  instance and instance of the same compiled module must then run `main` normally. The queue is checked with a hand-assembled module too: an export that traps
   while executing lets the call queued behind it run (`whenBusy: 'queue'`).
 - **bridge:** `test/e2e/brprog.jl` (WasmHost.Bridge, Julia tasks) in Chromium
   (`browser/brun.mjs`, the page's side `../bdrive.mjs`): each case asserted, the lifecycle's
