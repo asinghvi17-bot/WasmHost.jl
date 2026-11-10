@@ -1,5 +1,5 @@
 // node test/e2e/browser/reentry.mjs MODULE.wasm MODE(jspi|import)
-// The reentrancy checks of the browser adapter in Playwright's headless Chromium (page.mjs: window.checkReentry on the
+// The reentrancy checks of the browser adapter in Playwright's headless Chromium (page.mjs: window.checkReentry and checkStalledReentry on the
 // real module, MODULE.wasm, which ../run.mjs's programs are; window.checkQueueAfterRejection on a hand-assembled one).
 // Prints "reentry: WHAT: true|false" per check and "REENTRY PASS" or "REENTRY FAIL" (exit status 1); exits 77 and
 // prints "SKIP: ..." where the browser has no JSPI.
@@ -23,7 +23,9 @@ try {
   if (await page.evaluate(() => !(typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.promising === 'function'))) {
     console.log('SKIP: no JSPI in this browser'); process.exitCode = 77;
   } else {
-    const checks = [...await page.evaluate((a) => window.checkReentry(a), { wasm: '/module.wasm', mode, base: `http://127.0.0.1:${port}` }),
+    const cfg = { wasm: '/module.wasm', mode, base: `http://127.0.0.1:${port}` };
+    const checks = [...await page.evaluate((a) => window.checkReentry(a), cfg),
+                    ...await page.evaluate((a) => window.checkStalledReentry(a), cfg),
                     ...await page.evaluate(() => window.checkQueueAfterRejection())];
     for (const [what, ok] of checks) console.log(`reentry: ${what}: ${ok}`);
     const pass = checks.every(([, ok]) => ok);

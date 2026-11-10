@@ -52,9 +52,10 @@ window.runModule = async ({ wasm, mode, base, twice }) => {
   return out;
 };
 
-// The module of both checks below, and the same wiring as runModule's: { out, root, adapter, inst, wasi }.
-async function instantiate({ wasm, mode, base }) {
-  const mod = await WebAssembly.compileStreaming(fetch(wasm));
+// The module of the checks below, and the same wiring as runModule's: { out, root, adapter, inst, wasi, mod }.
+// `mod` (an already compiled module) and `fetchImpl` (the adapter's fetch) are optional.
+async function instantiate({ wasm, mode, base }, { mod = null, fetchImpl } = {}) {
+  mod ??= await WebAssembly.compileStreaming(fetch(wasm));
   const out = { stdout: [], stderr: [] };
   const root = new PreopenDirectory('/work', new Map([['out', new Directory(new Map())]]));
   const env = [`FETCH_BASE=${base}`, 'FETCH_OUT=/work/out', 'PWD=/work', 'WASMHOST_SPOOL=/work/.wasmhost'];
@@ -65,16 +66,16 @@ async function instantiate({ wasm, mode, base }) {
     root], { debug: false });
   let adapter, imports;
   if (mode === 'import') {
-    adapter = makeImports({ wasi, spool: '/work/.wasmhost' });
+    adapter = makeImports({ wasi, spool: '/work/.wasmhost', fetchImpl });
     imports = { wasi_snapshot_preview1: wasi.wasiImport, ...adapter.imports };
   } else {
-    adapter = wrapWasi(wasi, { spool: '/work/.wasmhost' });
+    adapter = wrapWasi(wasi, { spool: '/work/.wasmhost', fetchImpl });
     imports = { wasi_snapshot_preview1: adapter.wasiImport };
   }
   const inst = await WebAssembly.instantiate(mod, imports);
   adapter.bindMemory(inst.exports.memory);
   wasi.initialize(inst);
-  return { out, root, adapter, inst, wasi };
+  return { out, root, adapter, inst, wasi, mod };
 }
 
 const settled = (p) => p.then((v) => ({ ok: true, value: v }), (e) => ({ ok: false, name: e?.name, message: String(e?.message), cause: e?.cause?.name }));
@@ -117,6 +118,49 @@ window.checkReentry = async (cfg) => {
           [`a call after that rejects at once (${r3.name})`, immediate && poisonedName(r3)],
           ['the queued main never ran (only the suspended one\'s request was made)', requests === 1],
           ['every export rejects now', afterwards.length > 0 && afterwards.every(poisonedName)]];
+};
+
+// window.checkStalledReentry({ wasm, mode, base }) -> [what, ok]: the first host job is held open (a fetch that doesn't
+// settle until released), a main is queued behind it BEFORE the page re-enters the module, then the re-entrant call
+// poisons the instance. The queued main rejects with an InstancePoisonedError at once, while the first job is still
+// stalled (it is not waiting for it to settle), and a call after that rejects too. Then recovery: the held fetch is
+// released (the suspended main rejects), and a new WASI instance and instance of the same compiled module run a main
+// that succeeds.
+window.checkStalledReentry = async (cfg) => {
+  let release;
+  const held = new Promise((r) => { release = r; });
+  let fetches = 0;
+  const stalled = async (...args) => { fetches++; await held; return fetch(...args); };
+  const { inst, mod } = await instantiate(cfg, { fetchImpl: stalled });
+  const exports = promisingExports(inst);
+  const raw = WebAssembly.promising(inst.exports.main);
+  const first = settled(exports.main());
+  while (fetches === 0) await null;                      // (main is suspended in its first request, which is held open)
+  const queued = exports.main();                         // (queued behind it, before the re-entry)
+  const queuedSettled = settled(queued);
+  const reentrant = await settled(raw());                // (the host guard: poisons the instance)
+  const promptly = await settlesSoon(queued, 200);       // (the first job is still stalled: nothing released it)
+  const stillStalled = fetches === 1;
+  if (!promptly) release();                              // (a failure must not hang the check)
+  const r2 = await queuedSettled;
+  const later = exports.main();
+  const immediate = await settlesSoon(later);
+  const r3 = await settled(later);
+  const r0Early = await settlesSoon(first);              // (the suspended main isn't back before its request settles)
+  release();
+  const r0 = await first;
+  const poisonedName = (r) => !r.ok && r.name === 'InstancePoisonedError' && r.cause === 'ReentryError';
+  // a new instance from the same compiled module
+  const fresh = await instantiate(cfg, { mod });
+  const rc = await settled(promisingExports(fresh.inst).main());
+  return [[`the re-entrant call fails with a ReentryError (${reentrant.name})`, !reentrant.ok && reentrant.name === 'ReentryError'],
+          ['the first job is still stalled when the queued main is rejected', !r0Early && stillStalled],
+          [`the queued main rejects at once, with an InstancePoisonedError (${r2.ok ? 'returned ' + r2.value : r2.name})`, promptly && poisonedName(r2)],
+          [`a call after that rejects at once (${r3.name})`, immediate && poisonedName(r3)],
+          [`the suspended main rejects with an InstancePoisonedError once its request settles (${r0.ok ? 'returned ' + r0.value : r0.name})`, poisonedName(r0)],
+          ['the queued main never ran (only the first main made a request)', fetches === 1],
+          ['the instance is poisoned, and a new one from the same module is not', isPoisoned(inst) && !isPoisoned(fresh.inst)],
+          [`a new WASI and instance of the same module run a main normally (${rc.ok ? 'returned ' + rc.value : rc.name})`, rc.ok && rc.value === 0 && fresh.adapter.stats.requests > 0]];
 };
 
 // window.checkQueueAfterRejection() -> [what, ok]: promisingExports' queue on a module of two hand-assembled exports,

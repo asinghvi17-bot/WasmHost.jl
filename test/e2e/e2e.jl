@@ -150,7 +150,8 @@ end
 
 # (a browser) the module re-entered while it waits for the host (the page calls it behind promisingExports' queue): the
 # re-entrant call fails with a ReentryError and the instance is poisoned: the suspended main and the queued one reject
-# with an InstancePoisonedError, as does every call after (browser/reentry.mjs); a rejected executing export lets the
+# with an InstancePoisonedError, as does every call after (a queued one at once, even while the first request is
+# stalled; a new instance of the same module runs normally) (browser/reentry.mjs); a rejected executing export lets the
 # queued call run
 function reentry(wasm, mode)
     out = output(`$node $(joinpath(HERE, "browser", "reentry.mjs")) $wasm $mode`)
