@@ -17,7 +17,7 @@ Module (Julia, compiled by WasmCodegen with `tasks = :jspi` and `host_extensions
 
 ```julia
 const B = WasmHost.Bridge
-B.send(Dict("msg_type" => "2", "payload" => payload))   # module -> page; never suspends
+B.send(Dict{String,Any}("msg_type" => "2", "payload" => payload))   # module -> page; never suspends
 t = @async B.serve(msg -> handle(msg))                  # page -> module: parked in recv while there are none
 answer = B.ask(Dict{String,Any}("op" => "pick", "x" => 3))  # send, park until the page answers
 B.close("done")                                          # the end (serve ending closes it too)
@@ -147,7 +147,9 @@ the module is suspended (in a host job, or in `julia_io`'s `poll` with every tas
 the page called into the module directly, around `promisingExports`. It is a `ReentryError`
 thrown into that call, and it **poisons the instance**: the suspended call rejects with an
 `InstancePoisonedError`, as does every later call and host request (`js/browser/README.md`). The
-page's `bridge.post` never calls the module, so it is safe at any time. The Node adapter has no
+adapter knows the module is suspended in `poll` from the `events` it is given, so give `wrapWasi`
+the same `events` as `makeBridge`. The page's `bridge.post` never calls the module, so it is safe
+at any time. The Node adapter has no
 such guard (Node has no page that calls in).
 
 Re-entrant calls are deliberately not supported. An event is a handle completion of the call in

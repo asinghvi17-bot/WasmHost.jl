@@ -128,7 +128,7 @@ Plain Julia on the module's side:
 
 ```julia
 const B = WasmHost.Bridge
-B.send(Dict("msg_type" => "2", "payload" => payload))       # module -> page, never suspends
+B.send(Dict{String,Any}("msg_type" => "2", "payload" => payload))   # module -> page, never suspends
 t = @async B.serve(msg -> handle(msg))                      # page -> module: parked while there are none
 answer = B.ask(request)                                     # send, park until the page answers (or AskError)
 B.close("done")                                             # pending asks and a parked recv end: BridgeClosedError
