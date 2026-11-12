@@ -238,7 +238,7 @@ function concurrency(env, program, transport)
                 else
                     guard = lines(o, "task guard: ")
                     good &= lines(o, prefix) == want && occursin(r"^second call: rejected: ReentryError: "m, o) &&
-                            length(guard) == 4 && all(endswith(": true"), guard)
+                            length(guard) == 6 && all(endswith(": true"), guard)
                 end
                 println("== $program/$transport/$mode, main twice at once ($how): ", good ? "RIGHT" : "WRONG", "\n",
                         join(filter(l -> occursin(r"^(main returned|second call|task guard|server)", l), split(o, '\n')), '\n'), "\n")
