@@ -90,9 +90,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
         with:
-          # (feat/task-park-host-wait: Julia tasks on julia_io, asyncmap typed on Julia 1.12 and 1.13)
-          repository: asinghvi17-bot/WasmCodegen.jl
-          ref: 467d91ed800eedf56b249847b8032274a8fc8643
+          # (feat/task-park-host-wait: Julia tasks on julia_io, asyncmap typed on Julia 1.12 and 1.13; it predates
+          # WasmCodegen#91, the bytes arguments of host imports WasmHost.Page needs, so page is run on upstream's)
+          repository: ${{ matrix.part == 'page' && 'gbaraldi/WasmCodegen.jl' || 'asinghvi17-bot/WasmCodegen.jl' }}
+          ref: ${{ matrix.part == 'page' && '10cff8e4d04e451afe0946f5af90b8d39a76b724' || '467d91ed800eedf56b249847b8032274a8fc8643' }}
           path: wcg
       - uses: julia-actions/setup-julia@v2
         with:
