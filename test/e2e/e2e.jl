@@ -1,7 +1,7 @@
 # End-to-end checks: compile a program with WasmCodegen, run it in Node, Bun or a headless Chromium with WasmHost's
 # adapter, and compare it with native.
 #
-#   julia test/e2e/e2e.jl /path/to/WasmCodegen.jl [spool|import|decompress|concurrent|batch|all] [spool|import]
+#   julia test/e2e/e2e.jl /path/to/WasmCodegen.jl [spool|import|decompress|page|concurrent|batch|all] [spool|import]
 #
 # - spool, import: test/e2e/prog.jl (plain Downloads calls) against a local HTTP server
 #   (server.mjs). Its output and downloaded bytes must equal the same program run natively
@@ -10,6 +10,9 @@
 #   artifact tarball, gzip and zstd as the Pkg server serves it (and deflate). The decompressed
 #   bytes must equal what native Pkg's own decompressors give (`get_extract_cmd`: 7z, zstd),
 #   whose tree hash is the artifact's; the platform lines must equal the native run's.
+# - page: test/e2e/pprog.jl (WasmHost.Page) for WASI, both directions, with the page adapter
+#   (js/common/page.mjs, prun.mjs): its output and the messages it sends must equal the native
+#   run's (pnative.jl). Then for JavaScript (`host = :js`, sending only).
 #
 # - concurrent: test/e2e/cprog.jl, Downloads in Julia tasks (@sync/@async, asyncmap, a task fetched later), compiled
 #   with `tasks = :jspi` and `verify = :error`, run on WasmCodegen's julia_io events and julia_task (crun.mjs) against
@@ -26,10 +29,11 @@
 #   the page on one origin and server.mjs on another (CORS); the browser sends its own User-Agent instead of
 #   Downloads', so the native T3 body line is compared with the browser's User-Agent in it. decompress: the browser
 #   adapter's decompression alone (browser/decompress.mjs), as dprog.jl needs WasmCodegen's julia_regex. spool and
-#   import also call main twice at once through promisingExports (queued; rejected), and check the host guard.
+#   import also call main twice at once through promisingExports (queued; rejected), check the host guard, and re-enter the
+#   module behind the queue (reentry.mjs: the instance is poisoned).
 #
 # Environment: JULIA (default: this julia), WASM_RUNTIME (node, the default, bun or chromium), NODE (default: `node` on PATH,
-# Node 22+ with JSPI; zstd needs 22.15+) or BUN (default: `bun` on PATH), WASMBUILDER / IRSTRUCTURIZER (paths, optional: otherwise WasmCodegen's own
+# Node 24+, which has JSPI) or BUN (default: `bun` on PATH), WASMBUILDER / IRSTRUCTURIZER (paths, optional: otherwise WasmCodegen's own
 # [sources]), E2E_REUSE=1 (run modules an earlier run built, without rebuilding them),
 # E2E_ARTIFACTS (a directory with ARTIFACT.tar.gz and ARTIFACT.tar.zst, instead of downloading
 # them from pkg.julialang.org).
@@ -48,7 +52,8 @@ runtime = get(ENV, "WASM_RUNTIME", "node")
 runtime in ("node", "bun", "chromium") || error("WASM_RUNTIME must be node, bun or chromium, not $(repr(runtime))")
 const BROWSER = runtime == "chromium"
 driver = BROWSER ? "node" : runtime
-node = get(ENV, uppercase(driver), something(Sys.which(driver), driver))
+node = something(get(ENV, uppercase(driver), nothing), Sys.which(driver), Some(nothing))
+node === nothing && error("$driver is not on PATH: install it (Node 24+ or Bun) or set $(uppercase(driver)) to its path")
 work = mkpath(joinpath(HERE, "work"))
 
 # a real artifact (Bzip2_jll's binaries for aarch64-linux-gnu; any artifact works): its tree hash
@@ -97,11 +102,8 @@ function output(cmd)
     return out
 end
 
-# (JSPI is on by default in newer Node, and Node 26 rejects --experimental-wasm-jspi: the flag only where the API is
-# missing without it, Node 22)
-jspi_flags(node) = success(pipeline(`$node -e "process.exit(typeof WebAssembly.Suspending === 'function' ? 0 : 1)"`;
-                                    stdout = devnull, stderr = devnull)) ? `` : `--experimental-wasm-jspi`
-const NODE_FLAGS = runtime == "node" ? `$(jspi_flags(node)) --disable-warning=ExperimentalWarning` : ``
+# (JSPI needs no flag: it is on by default in Node 24+, and Node 26 rejects --experimental-wasm-jspi as a "bad option")
+const NODE_FLAGS = runtime == "node" ? `--disable-warning=ExperimentalWarning` : ``
 
 function build(env, wasm, transport, program)
     get(ENV, "E2E_REUSE", "") == "1" && isfile(wasm) && return
@@ -134,7 +136,7 @@ function downloads(env, transport)
                occursin("spool files left: 0", out)
         println("== $transport/$mode: ", same ? "IDENTICAL to native" * (BROWSER ? " (the echoed User-Agent: the browser's)" : "") : "DIFFERENT", "\n", out)
         ok &= same
-        BROWSER && (ok &= twice(wasm, mode, native))
+        BROWSER && (ok &= twice(wasm, mode, native) & reentry(wasm, mode))
     end
     return ok
 end
@@ -154,13 +156,25 @@ function twice(wasm, mode, native)
         else
             guard = lines(out, "host guard: ")
             good &= lines(out, "T") == want && occursin(r"^second call: rejected: ReentryError: "m, out) &&
-                    length(guard) == 4 && all(endswith(": true"), guard)
+                    length(guard) == 6 && all(endswith(": true"), guard)
         end
         println("== $mode, main twice at once ($how): ", good ? (how == "queue" ? "both IDENTICAL to native, one after the other" :
                                                                 "the second REJECTED, the first IDENTICAL to native") : "WRONG", "\n", out)
         ok &= good
     end
     return ok
+end
+
+# (a browser) the module re-entered while it waits for the host (the page calls it behind promisingExports' queue): the
+# re-entrant call fails with a ReentryError and the instance is poisoned: the suspended main and the queued one reject
+# with an InstancePoisonedError, as does every call after (a queued one at once, even while the first request is
+# stalled; a new instance of the same module runs normally) (browser/reentry.mjs); a rejected executing export lets the
+# queued call run
+function reentry(wasm, mode)
+    out = output(`$node $(joinpath(HERE, "browser", "reentry.mjs")) $wasm $mode`)
+    good = occursin("REENTRY PASS", out)
+    println("== $mode, module re-entered: ", good ? "POISONED as it should be" : "WRONG", "\n", out)
+    return good
 end
 
 # the compressed artifact, both encodings of the Pkg server
@@ -284,11 +298,30 @@ function decompression(env)
     return ok
 end
 
-# (the browser's decompress part compiles nothing)
+# page messages: for WASI, then for JavaScript (sending only); in Node or Bun (prun.mjs), not in a browser
+function page(env)
+    native = output(`$julia --startup-file=no --project=$env $(joinpath(HERE, "pnative.jl"))`)
+    print("native:\n", native)
+    want(prefix) = lines(native, prefix)
+    ok = occursin("page check: true", native)
+    for host in ("wasi", "js")
+        wasm = joinpath(work, "page-$host.wasm")
+        build(env, wasm, host, "page")
+        out = output(`$node $(joinpath(HERE, "prun.mjs")) $wasm $host $(joinpath(wcg, "js", "julia.mjs"))`)
+        same = occursin("page check: true", out) && lines(out, "S") == want("S") && lines(out, "U") == want("U") &&
+               (host == "js" || lines(out, "R") == want("R"))
+        println("== page/$host: ", same ? "IDENTICAL to native" : "DIFFERENT", "\n", out)
+        ok &= same
+    end
+    return ok
+end
+
+# (the browser's decompress part compiles nothing; the page part has no browser runner)
+BROWSER && which == "page" && error("e2e page: not in chromium (WasmHost.Page is tested in Node and Bun only)")
 env = BROWSER && which == "decompress" ? nothing : setup_env(joinpath(work, "env"))
 ok = true
-for part in (which == "all" ? ["spool", "import", "decompress", "concurrent", "batch"] : [which])
-    global ok &= part == "decompress" ? decompression(env) :
+for part in (which == "all" ? ["spool", "import", "decompress", (BROWSER ? () : ("page",))..., "concurrent", "batch"] : [which])
+    global ok &= part == "decompress" ? decompression(env) : part == "page" ? page(env) :
                  part in ("concurrent", "batch") ? (which == "all" ? all(t -> concurrency(env, part, t), ("spool", "import")) :
                                                     concurrency(env, part, get(ARGS, 3, "spool"))) :
                  downloads(env, part)

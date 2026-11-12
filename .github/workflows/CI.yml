@@ -5,7 +5,7 @@ on:
   pull_request:
 jobs:
   test:
-    name: Julia ${{ matrix.julia-version }}, ${{ matrix.runtime }}
+    name: Julia ${{ matrix.julia-version }}, ${{ matrix.runtime == 'node' && format('node {0}', matrix.node-version) || 'bun' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -13,6 +13,11 @@ jobs:
         julia-version: ['1.12', '1.13']
         # the JavaScript adapter's tests (test/runtests.jl) in Node and in Bun: WASM_RUNTIME
         runtime: [node, bun]
+        # (the Node versions: 24 is the minimum, JSPI on without a flag; the axis means nothing to Bun)
+        node-version: ['24', '26']
+        exclude:
+          - runtime: bun
+            node-version: '26'
     env:
       WASM_RUNTIME: ${{ matrix.runtime }}
     steps:
@@ -23,7 +28,7 @@ jobs:
       - if: matrix.runtime == 'node'
         uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          node-version: ${{ matrix.node-version }}
       - if: matrix.runtime == 'bun'
         uses: oven-sh/setup-bun@v2
         with:
@@ -42,25 +47,44 @@ jobs:
   # programs run natively. The decompress part needs WasmCodegen's julia_regex host extension, which WasmCodegen no
   # longer has: it is not run here (on any runtime); in Chromium, `decompress` checks the adapter's decompression alone.
   e2e:
-    name: e2e ${{ matrix.part }}, ${{ matrix.runtime }}
+    name: e2e ${{ matrix.part }}, ${{ matrix.runtime == 'node' && format('node {0}', matrix.node-version) || matrix.runtime }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        part: [spool, import]
+        # (page: WasmHost.Page for WASI, both directions, and for JavaScript, sending only; not in chromium)
+        part: [spool, import, page]
         runtime: [node, bun, chromium]
+        node-version: ['24', '26']
+        exclude:
+          - runtime: bun
+            node-version: '26'
+          # (Chromium is driven by Node 24)
+          - runtime: chromium
+            node-version: '26'
+          - runtime: chromium
+            part: page
         include:
           - part: decompress
             runtime: chromium
+            node-version: '24'
           # (Julia tasks and the host's batch, `verify = :error`: both transports, `all`'s order)
           - part: concurrent
             runtime: node
+            node-version: '24'
+          - part: concurrent
+            runtime: node
+            node-version: '26'
           - part: batch
             runtime: node
+            node-version: '24'
+          - part: batch
+            runtime: node
+            node-version: '26'
     env:
       WASM_RUNTIME: ${{ matrix.runtime }}
-      # (a run skipped for an engine gap fails the job: none is documented for Node 24 or Bun 1.4)
+      # (a run skipped for an engine gap fails the job: none is documented for Node 24, Node 26 or Bun 1.4)
       E2E_ALLOW_SKIP: '0'
     steps:
       - uses: actions/checkout@v4
@@ -80,7 +104,7 @@ jobs:
       - if: matrix.runtime == 'node' || matrix.runtime == 'chromium'
         uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          node-version: ${{ matrix.node-version }}
           # (npm's cache, keyed on the e2e's lockfile: chromium only)
           cache: ${{ matrix.runtime == 'chromium' && 'npm' || '' }}
           cache-dependency-path: test/e2e/browser/package-lock.json
@@ -101,7 +125,7 @@ jobs:
         run: |
           npm ci
           npx playwright install --with-deps --only-shell chromium
-      - name: e2e ${{ matrix.part }} in ${{ matrix.runtime }}
+      - name: e2e ${{ matrix.part }} in ${{ matrix.runtime }}${{ matrix.runtime == 'node' && format(' {0}', matrix.node-version) || '' }}
         run: |
           if [ "${{ matrix.part }}" = concurrent ] || [ "${{ matrix.part }}" = batch ]; then
             for t in spool import; do julia --startup-file=no test/e2e/e2e.jl wcg ${{ matrix.part }} $t || exit 1; done

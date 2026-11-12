@@ -18,11 +18,13 @@
 //     written back; returns its length (or -length when res_cap is too small: nothing
 //     written). Suspending (JSPI): the export must be called through WebAssembly.promising
 //     (promisingExports). A request while another of the module is in flight (the page called
-//     the module directly, again) throws a ReentryError into the module.
+//     the module directly, again) throws a ReentryError into the re-entrant call and poisons the
+//     instance: the suspended call rejects with an InstancePoisonedError instead of resuming, as
+//     does every later call (jspi.mjs); recovery is a new instance.
 //   wasm_host.http_start, http_finish (a module with Julia tasks: `events`), http_batch and
 //     http_batch_result: as the Node adapter's (../node/imports.mjs), http_start's optional
-//     body too. A start while the module
-//     is suspended (a re-entry) throws a ReentryError into the module.
+//     body too. A start while the module is suspended (a re-entry) throws a ReentryError into
+//     the module and poisons the instance in the same way.
 // `fetchImpl` replaces `fetch`; `credentials` is fetch's (default 'omit'). `events`: the
 // julia_io events (WasmCodegen's js/julia_io.mjs) of a module with tasks, whose exports are
 // called through `promisingExports(inst, { tasks: jt })`: its requests overlap.

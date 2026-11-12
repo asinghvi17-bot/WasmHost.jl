@@ -1,4 +1,4 @@
-// node [--experimental-wasm-jspi] | bun   drun.mjs MODULE.wasm MODE(jspi|sync) WORKDIR INDIR WASMCODEGEN
+// node | bun   drun.mjs MODULE.wasm MODE(jspi|sync) WORKDIR INDIR WASMCODEGEN
 // Runs dprog.jl's module on Node's WASI with WasmHost's spool adapter: the compressed artifacts
 // of INDIR (copied to WORKDIR/in), decompressed into WORKDIR/out. The platform tags are
 // E2E_PLATFORM (the harness passes the same to the native run), or detected. The module's

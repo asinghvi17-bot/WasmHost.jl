@@ -10,6 +10,7 @@ WasmCodegen = "5b0f1d7e-3c2a-4e8b-9a61-7d2f4c8e1a93"
 
 [extensions]
 WasmHostDownloadsExt = ["Downloads", "WasmCodegen"]
+WasmHostPageExt = "WasmCodegen"
 WasmHostPkgExt = ["Pkg", "WasmCodegen"]
 WasmHostPlatformExt = "WasmCodegen"
 WasmHostRequestAllExt = "Downloads"

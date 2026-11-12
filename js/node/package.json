@@ -5,17 +5,18 @@
   "description": "Node adapter of WasmHost.jl: downloads (fetch), decompression (node:zlib) and platform tags for WASI modules compiled by WasmCodegen.jl. Not published yet.",
   "license": "MIT",
   "type": "module",
-  "engines": { "node": ">=22", "bun": ">=1.4" },
+  "engines": { "node": ">=24", "bun": ">=1.4" },
   "exports": {
     ".": "./index.mjs",
     "./spool": "./spool.mjs",
     "./imports": "./imports.mjs",
-    "./platform": "./platform.mjs"
+    "./platform": "./platform.mjs",
+    "./page": "./page.mjs"
   },
   "wasmhost": {
     "transports": ["spool", "import"],
     "waiting": ["jspi", "sync"],
-    "capabilities": { "downloads": "spool, import", "decompress": "spool: gzip, deflate; zstd on Node >= 22.15", "platform": "WASI env" },
+    "capabilities": { "downloads": "spool, import", "decompress": "spool: gzip, deflate, zstd", "platform": "WASI env", "page": "wasm_host_page" },
     "tested": true
   }
 }

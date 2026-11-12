@@ -2,7 +2,7 @@
     WasmHost.Decompress
 
 Decompression of a file by the host: gzip and deflate on every host with an adapter, zstd where
-the host has it (Node 22.15 or newer). See [`decompress`](@ref).
+the host has it. See [`decompress`](@ref).
 
 Protocol `wasm-decompress 1`, in `<spool>/<id>.dreq` and `<spool>/<id>.dres` (always the spool
 directory, whatever [`WasmHost.transport`](@ref) says):
