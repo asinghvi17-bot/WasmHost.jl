@@ -1,4 +1,4 @@
-// node [--experimental-wasm-jspi] | bun   run.mjs MODULE.wasm MODE(jspi|sync|import|none) WORKDIR
+// node | bun   run.mjs MODULE.wasm MODE(jspi|sync|import|none) WORKDIR
 // Starts server.mjs in a child process, runs the module's `main` on node:wasi (Node's or Bun's) with the
 // WasmHost adapter (or without it: MODE none), prints the module's output and checks the
 // downloaded file against the server's bytes.

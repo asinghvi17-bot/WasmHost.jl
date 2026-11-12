@@ -1,6 +1,6 @@
 // WasmHost's decompression on Node: one request of protocol "wasm-decompress 1" done with
 // node:zlib. gzip and deflate (zlib format) on every supported Node; zstd where node:zlib has
-// it (Node 22.15 / 23.8 and newer).
+// it.
 import fs from 'node:fs';
 import zlib from 'node:zlib';
 import { pipeline } from 'node:stream/promises';

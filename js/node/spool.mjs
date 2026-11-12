@@ -26,7 +26,7 @@
 // `mode`:
 //   - 'jspi': `path_open` is a `WebAssembly.Suspending`: the module waits with its stack
 //     suspended; exports that download or decompress must be called through
-//     `WebAssembly.promising` (Node: --experimental-wasm-jspi where not on by default).
+//     `WebAssembly.promising` (Node 24+ and Bun have it on by default).
 //   - 'sync': the work runs on a worker thread while the main thread blocks in `Atomics.wait`.
 // `fetchImpl` replaces `fetch` (jspi mode only; e.g. to refuse all requests). `events`: the
 // julia_io events (WasmCodegen's js/julia_io.mjs, `makeJuliaIOEvents()`) a module with tasks
@@ -161,7 +161,7 @@ export function wrapWasi(wasiImport, { preopens = {}, spool, mode = 'jspi', fetc
   let path_open;
   if (mode === 'jspi') {
     if (typeof WebAssembly.Suspending !== 'function')
-      throw new Error('wasmhost: mode "jspi" needs JavaScript Promise Integration (Node: --experimental-wasm-jspi)');
+      throw new Error('wasmhost: mode "jspi" needs JavaScript Promise Integration (Node 24+ or Bun)');
     path_open = new WebAssembly.Suspending((...args) => {
       const p = pending(args[0], args[2], args[3]);
       if (p === null) return original(...args);

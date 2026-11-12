@@ -39,7 +39,8 @@
 // aren't the program's); `wasiImport` replaces `wasi.wasiImport` (e.g. a wrapped one); `events`:
 // the julia_io events (WasmCodegen's js/julia_io.mjs) of a module with tasks, whose exports are
 // called through `promisingExports(inst, { tasks: jt })`: its requests overlap. A start while
-// the module is suspended (a re-entry) throws a ReentryError into the module.
+// the module is suspended (a re-entry) throws a ReentryError into the module and poisons the
+// instance in the same way.
 import { parseRequest, formatResult, parseBatch, formatBatch } from '../common/fetch.mjs';
 import { checkEvents, makeJobs } from '../common/jobs.mjs';
 import { parseDecompressRequest, formatDecompressAnswer } from '../common/decompress.mjs';

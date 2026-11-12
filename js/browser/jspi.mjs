@@ -125,13 +125,15 @@ export function promisingExports(instance, { whenBusy = 'queue', tasks } = {}) {
 // julia_io's poll (`events`), i.e. when the page called into the module again (not through
 // promisingExports) while it waited, that is a ReentryError, and it poisons the instance (the
 // WASI instance, and the module instance it was initialized with): `run` rejects with the
-// ReentryError, which the adapter lets propagate into the re-entrant call, and the suspended job
-// rejects with an InstancePoisonedError instead of resuming its caller, as does every later job.
-// WasmCodegen's handlers catch only Julia's own exceptions, so the errors unwind the module's
-// frames without running its `finally` blocks: harmless only because nothing of the instance is
-// used again. (A module suspended in julia_io's poll is WasmCodegen's to resume: it does, and its
-// export's result is then replaced by the InstancePoisonedError in promisingExports.)
+// ReentryError, which the adapter lets propagate into the re-entrant call, and the suspended
+// job rejects with an InstancePoisonedError instead of resuming its caller, as does every later
+// job. WasmCodegen's handlers catch only Julia's own exceptions, so the errors unwind the
+// module's frames without running its `finally` blocks: harmless only because nothing of the
+// instance is used again. (A module suspended in julia_io's poll, not in a job, resumes when a
+// request it waits for is done; its next host call, e.g. `http_finish`, then throws the
+// InstancePoisonedError, and its export's result is rejected by promisingExports.)
 const busy = new WeakMap();
+const REENTRY = 'wasmhost: the module was called again while it waits (call it through promisingExports)';
 export function oneAtATime(wasi, events) {
   const check = notSuspended(wasi, events);
   return async function run(job) {
@@ -157,7 +159,7 @@ export function notSuspended(wasi, events) {
   return function check() {
     checkPoisoned(wasi, 'request refused');
     if (busy.get(wasi) || events?.polling?.()) {
-      const err = new ReentryError('wasmhost: the module was called again while it waits (call it through promisingExports)');
+      const err = new ReentryError(REENTRY);
       poison(wasi, err);
       throw err;
     }

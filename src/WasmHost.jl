@@ -10,6 +10,9 @@ nothing changes.
   (and so `Downloads.download`) use it in the compiled module.
 - [`WasmHost.Decompress`](@ref): gzip, deflate and zstd decompression of a file by the host.
 - [`WasmHost.Platform`](@ref): the host's platform tags, passed in the WASI environment.
+- [`WasmHost.Page`](@ref): messages (bytes) between the program and the JavaScript around it, over
+  the import library `wasm_host_page`; with the package extension `WasmHostPageExt` in the
+  compiled module.
 - [`WasmHost.Bridge`](@ref): messages between the module and its page, in both directions (a
   Makie scene's browser events, a session's `evaljs`).
 
@@ -100,6 +103,7 @@ end
 include("downloads.jl")
 include("decompress.jl")
 include("platform.jl")
+include("page.jl")
 include("bridge.jl")
 
 end # module

@@ -3,9 +3,12 @@
 The Julia side of WasmHost is host-agnostic: its modules and the protocols don't know which
 runtime they run on. A build only chooses the **transport** of its downloads:
 - **spool:** files of a spool directory over the WASI filesystem. Decompression always uses it.
-- **import:** the import library `wasm_host`, which needs `Config(import_libraries)`, an
-  upstream WasmCodegen change under discussion
-  ([gbaraldi/WasmCodegen.jl#57](https://github.com/gbaraldi/WasmCodegen.jl/pull/57)).
+- **import:** the import library `wasm_host`, which needs `Config(import_libraries)`
+  ([gbaraldi/WasmCodegen.jl#57](https://github.com/gbaraldi/WasmCodegen.jl/pull/57), merged).
+
+Page messages (`WasmHost.Page`, the import library `wasm_host_page`) need neither: only the
+module's memory. Their host side is `common/page.mjs` (`makePage`), the same for every host,
+which `node/page.mjs` and `browser/page.mjs` re-export.
 
 There is one adapter per host family, laid out as a future npm package with its own
 `package.json` (`"private": true`: nothing is published yet). They share the host-independent
@@ -14,7 +17,7 @@ code in `common/`.
 | Directory | Future package | Host | Downloads | Decompression | Platform tags | Waiting | Tested? |
 |---|---|---|---|---|---|---|---|
 | `common/` | (bundled into each) | any | protocol `wasm-fetch 1`, libcurl's error codes | protocol `wasm-decompress 1`, magic bytes | merging, checking, `WASMHOST_PLATFORM` | – | through Node and Chromium |
-| `node/` | `@wasmhost/node` | Node 22+ and Bun 1.4+ (`node:wasi`) | spool: `spool.mjs`; import: `imports.mjs` | spool: gzip, deflate; zstd on Node ≥ 22.15 (`node:zlib`) | `platform.mjs` (arch, os, libc) | JSPI; sync worker + `Atomics.wait` (spool) | **yes**, end to end against native |
+| `node/` | `@wasmhost/node` | Node 24+ and Bun 1.4+ (`node:wasi`) | spool: `spool.mjs`; import: `imports.mjs` | spool: gzip, deflate, zstd (`node:zlib`) | `platform.mjs` (arch, os, libc) | JSPI; sync worker + `Atomics.wait` (spool) | **yes**, end to end against native |
 | `browser/` | `@wasmhost/browser` | browsers with JSPI (Chrome/Edge 137+), on `@bjorn3/browser_wasi_shim` | spool: `spool.mjs`; import: `imports.mjs` (bodies in the shim's in-memory filesystem) | spool: `DecompressionStream`: gzip, deflate; zstd where the browser has it (not Chromium 158) | none to detect | JSPI only; one call at a time per module (`promisingExports`); a re-entrant call poisons the instance (make a new one) | **yes**, end to end against native in headless Chromium 158 (Playwright); decompression: the adapter alone |
 | `workerd/` | – | Cloudflare workerd | import | `DecompressionStream` | – | JSPI if available | **no**: notes |
 | `wasmtime/` | – | wasmtime | import, from an embedding | the embedding's | the embedding's | the embedding's | **no**: notes |

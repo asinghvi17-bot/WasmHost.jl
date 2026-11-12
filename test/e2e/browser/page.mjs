@@ -315,38 +315,32 @@ window.runConcurrent = async ({ wasm, mode, base, n, events: useEvents = true, t
 };
 
 window.checkTaskGuard = async () => {
-  // (each case on an instance of its own: a guard hit poisons the instance)
-  const guard = () => {
-    const g = { inst: {}, polling: false };
-    g.wasi = { inst: g.inst };
-    const events = { polling: () => g.polling };
-    g.check = notSuspended(g.wasi, events);
-    g.run = oneAtATime(g.wasi, events);
-    return g;
-  };
-  const refused = (f, E = ReentryError) => { try { f(); return false; } catch (e) { return e instanceof E; } };
+  let polling = false;
+  const events = { polling: () => polling };
+  // (a fresh WASI instance per case: a guard hit poisons the one it hits)
+  const guard = () => { const wasi = {}; return { wasi, check: notSuspended(wasi, events), run: oneAtATime(wasi, events) }; };
+  const thrown = (f) => { try { f(); return null; } catch (e) { return e; } };
   const a = guard();
-  const startsWhileRunning = !refused(a.check) && !refused(a.check) && !isPoisoned(a.inst);  // (two starts of running tasks: both fine)
+  const startsWhileRunning = thrown(a.check) === null && thrown(a.check) === null;   // (two starts of running tasks: both fine)
+  polling = true;
   const b = guard();
-  b.polling = true;
-  const startWhilePolling = refused(b.check) && isPoisoned(b.inst);
-  b.polling = false;
-  const startAfterPoison = refused(b.check, InstancePoisonedError);
+  const startWhilePolling = thrown(b.check) instanceof ReentryError && isPoisoned(b.wasi);
+  const startAfterPoison = thrown(b.check) instanceof InstancePoisonedError;
   const c = guard();
-  c.polling = true;
-  const jobWhilePolling = await c.run(async () => 'ran').then(() => false, (e) => e instanceof ReentryError) && isPoisoned(c.inst);
+  const jobWhilePolling = await c.run(async () => 'ran').then(() => false, (e) => e instanceof ReentryError) && isPoisoned(c.wasi);
+  polling = false;
   const d = guard();
   let release;
   const first = d.run(() => new Promise((r) => { release = r; })).then(() => null, (e) => e);
-  const startWhileJob = refused(d.check) && isPoisoned(d.inst);
+  const startWhileJob = thrown(d.check) instanceof ReentryError;
   release();
-  const firstErr = await first;
-  return [['starts while the module runs: allowed', startsWhileRunning],
-          ['a start while it is suspended in poll: ReentryError, poisoned', startWhilePolling],
+  const firstJob = await first;
+  return [['starts while the module runs: allowed', startsWhileRunning && !isPoisoned(a.wasi)],
+          ['a start while it is suspended in poll: ReentryError, and poisons', startWhilePolling],
           ['a start after that: InstancePoisonedError', startAfterPoison],
-          ['a suspending job while it is suspended in poll: ReentryError, poisoned', jobWhilePolling],
-          ['a start while a suspending job is in flight: ReentryError, poisoned', startWhileJob],
-          ['that job rejects with an InstancePoisonedError', firstErr instanceof InstancePoisonedError]];
+          ['a suspending job while it is suspended in poll: ReentryError, and poisons', jobWhilePolling],
+          ['a start while a suspending job is in flight: ReentryError', startWhileJob],
+          ['the job in flight then rejects with an InstancePoisonedError', firstJob instanceof InstancePoisonedError]];
 };
 
 // window.runBridge({ wasm, which }) -> { jspiGap } | { checks, stdout, stderr, stats, imports }: brprog.jl's module

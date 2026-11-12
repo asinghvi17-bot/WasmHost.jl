@@ -24,7 +24,7 @@
 //   wasm_host.http_start, http_finish (a module with Julia tasks: `events`), http_batch and
 //     http_batch_result: as the Node adapter's (../node/imports.mjs), http_start's optional
 //     body too. A start while the module is suspended (a re-entry) throws a ReentryError into
-//     the re-entrant call and poisons the instance, the same way.
+//     the module and poisons the instance in the same way.
 // `fetchImpl` replaces `fetch`; `credentials` is fetch's (default 'omit'). `events`: the
 // julia_io events (WasmCodegen's js/julia_io.mjs) of a module with tasks, whose exports are
 // called through `promisingExports(inst, { tasks: jt })`: its requests overlap.
