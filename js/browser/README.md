@@ -7,6 +7,12 @@ filesystem holds the spool directory and the bodies. No `node:` module, and no i
 `../common/`: the adapter uses the shim's WASI instance it is given, so the page chooses the
 shim's version (tested: 0.4.2).
 
+## Page messages
+
+`page.mjs` is `common/page.mjs` (`WasmHost.Page`, the import library `wasm_host_page`). It needs
+only the module's memory: no filesystem, no JSPI. It is tested in Node and Bun (`test/e2e`,
+`prun.mjs`), not in a browser.
+
 **Tested** end to end in headless Chromium 158 (Playwright), against native, in CI:
 `test/e2e/e2e.jl` with `WASM_RUNTIME=chromium` (see [Testing](#testing)).
 

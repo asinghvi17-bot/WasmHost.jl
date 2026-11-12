@@ -5,3 +5,4 @@ export { perform, curlCode } from './http.mjs';
 export { decompressFile, hasFormat } from './decompress.mjs';
 export { makeShimFs } from './fs.mjs';
 export { jspiGap, promisingExports, isPoisoned, ReentryError, InstancePoisonedError } from './jspi.mjs';
+export { makePage, LIBRARY } from './page.mjs';

@@ -9,15 +9,16 @@ performed by the JavaScript host around the module. Natively nothing changes.
 | `WasmHost.Downloads` | HTTP requests with the host's `fetch` (TLS, redirects and proxies are the host's) | plain `Downloads.download` / `Downloads.request`, through the package extension |
 | `WasmHost.Decompress` | gzip, deflate and zstd decompression of a file by the host | `WasmHost.Decompress.decompress(src, dst)` |
 | `WasmHost.Platform` | the host's platform tags (arch, os, libc, ...) from the WASI environment | `WasmHost.Platform.host_platform()` |
+| `WasmHost.Page` | messages (bytes) between the program and the JavaScript around it: a page, a worker, a Node script | `WasmHost.Page.send(bytes)`, `receive()`, `poll(f)`, through the package extension |
 
 ```julia
 using Downloads
 f() = String(take!(Downloads.download("https://example.org/data.csv", IOBuffer())))
 ```
 
-**Status:** an early release. Tested end to end against native on **Node** (and Bun) and in
-**Chromium** (headless, Playwright), with both transports. Other hosts are designed but
-untested; see [Hosts](#hosts).
+**Status:** an early release. Tested end to end against native on **Node** and **Bun** (CI)
+and in **Chromium** (headless, Playwright), with both transports, spool and import. Other hosts
+are designed but untested; see [Hosts](#hosts).
 
 WasmHost.jl was called WasmFetch.jl until it gained decompression and platform tags. Same UUID.
 
@@ -32,20 +33,19 @@ WasmHost.jl was called WasmFetch.jl until it gained decompression and platform t
   a pending response does the work first. The module imports only `wasi_snapshot_preview1`.
   The protocols, `wasm-fetch 1` and `wasm-decompress 1`, are documented in `src/downloads.jl`
   and `src/decompress.jl`.
-- **The import transport (requires an upstream change under discussion).** A
-  `wasm_host.http_request` import, for downloads only. It needs WasmCodegen to let a program
-  declare an import library of its own, `Config(import_libraries = ["wasm_host"])`, which is
-  proposed upstream in
-  [gbaraldi/WasmCodegen.jl#57](https://github.com/gbaraldi/WasmCodegen.jl/pull/57) and not
-  merged. It also uses WasmCodegen's staging area of the linear memory (`Runtime.Staging`) to
-  pass the request and response text. It has been tested only against a local WasmCodegen
-  build that has both.
+- **The import transport.** A `wasm_host.http_request` import, for downloads only. It needs
+  WasmCodegen to let a program declare an import library of its own,
+  `Config(import_libraries = ["wasm_host"])`
+  ([gbaraldi/WasmCodegen.jl#57](https://github.com/gbaraldi/WasmCodegen.jl/pull/57), merged on
+  2026-11-05). It also uses WasmCodegen's staging area of the linear memory
+  (`Runtime.Staging`) to pass the request and response text. CI's end-to-end test runs it
+  against the WasmCodegen commit the workflow pins.
 - **Waiting.** The host's work is asynchronous, and the adapter waits in one of two ways:
   - **`jspi`:** the intercepted `path_open`, or `wasm_host.http_request`, is a
     `WebAssembly.Suspending`, so the module is suspended while the host works. Call the export
     through `WebAssembly.promising`.
   - **`sync`:** the work runs on a worker thread while the main thread blocks in
-    `Atomics.wait`. Node only, spool transport only. Browsers wait with JSPI only.
+    `Atomics.wait`. Spool transport only, not in browsers: they wait with JSPI only.
 
 ## Downloads
 
@@ -90,14 +90,13 @@ WasmHost.Decompress.decompress(src, dst; format = :auto)   # -> abspath(dst)
 - **Formats:** `:auto` recognizes gzip and zstd by their magic bytes, as Pkg's
   `detect_archive_format` does; `:gzip`, `:deflate` (the zlib format, RFC 1950) and `:zstd`
   name one.
-- **Hosts:** gzip and deflate on every host with an adapter; zstd where the host has it (Node
-  22.15 or newer).
+- **Hosts:** gzip and deflate on every host with an adapter; zstd where the host has it.
 - **Errors:** a `DecompressError(errno, message)` with a WASI errno:
   - `EILSEQ` (25): the data isn't of the format, or of no format `:auto` knows;
   - `EIO` (29): corrupt data or an I/O error;
   - `ENOENT` (44): no source file;
   - `ENOSYS` (52): no host adapter (natively, too), or no decompressor for the format (bzip2,
-    xz and lz4 by magic bytes; zstd on an older Node).
+    xz and lz4 by magic bytes; zstd on a host without it).
 
   `dst` doesn't exist after a failure.
 - **Transport:** always the spool directory, also in a build whose downloads use the import
@@ -134,19 +133,86 @@ WasmHost.Platform.host_platform()   # a Base.BinaryPlatforms.Platform, as HostPl
   tags it equals `HostPlatform()` (tested).
 - **An older variable name:** a program that used another name passes it,
   `host_platform(names = ("WASMHOST_PLATFORM", "OLD_NAME"))`; the first one set wins.
-- **Regex:** `host_platform()` needs WasmCodegen's host regex engine,
-  `Config(host_extensions = [:julia_regex])` (and the host's `julia_regex.mjs`). The
-  `Platform` constructor can parse version tags with a `Regex`, so the closed world contains
-  it. `tags()` doesn't need it.
+- **Regex:** `host_platform()` needs a regex engine in the module. The `Platform` constructor
+  can parse version tags with a `Regex`, so the closed world contains it. WasmCodegen's
+  `:julia_regex` host extension no longer exists; use
+  [WasmCompat.jl](https://github.com/JuliaWASM/WasmCompat.jl)'s PCRE2 backend, opt-in through
+  `WasmCompat.pcre2_config(WasmCodegen.Config(host = :wasi))` (the host also instantiates
+  `libpcre2-8.wasm`: WasmCompat's `js/pcre2.mjs`). `tags()` doesn't need it.
+
+## Page
+
+Messages between the program and the JavaScript around it. What the bytes mean is up to the
+program and the page: a plot's MsgPack update, JSON, text.
+
+```julia
+WasmHost.Page.send(bytes)         # a Vector{UInt8} or a String: the page's onMessage gets the bytes
+WasmHost.Page.receive()           # the page's next posted message (a Vector{UInt8}), or nothing
+WasmHost.Page.poll(f)             # f(bytes) for each posted message; how many there were
+```
+
+```js
+import { makePage } from './WasmHost.jl/js/common/page.mjs';   // (or js/node/, js/browser/page.mjs)
+const page = makePage({ onMessage: (bytes) => deliver(bytes.slice()) });
+const inst = await WebAssembly.instantiate(mod, { ...wasiImports, ...page.imports });
+page.bindMemory(inst.exports.memory);
+page.post(new TextEncoder().encode('{"zoom": 3}'));   // read by the program's next receive/poll
+```
+
+- **Building:** pass `import_libraries = ["wasm_host_page"]` to `Config`. The package extension
+  `WasmHostPageExt` (loaded with WasmCodegen) compiles `Page`'s methods. The import library's
+  protocol is documented in `src/page.jl`, and its host side is `js/common/page.mjs`, which
+  needs no Node or browser API.
+- **The bytes are the page's only during `onMessage`.** A message is a view of the module's
+  memory: the module's next send writes over it, even one made from `onMessage` by calling back
+  into the module, and growing the memory detaches it. Copy it (`bytes.slice()`) to keep it.
+- **An exception of `onMessage` stays on the page's side:** `onError(error, bytes)` gets it (by
+  default it is logged), `stats.errors` counts it, and `send` returns as usual. Thrown into the
+  module, it would unwind the module's frames without running their `finally` blocks, because
+  WasmCodegen catches only Julia's exceptions. Staging's scope would then stay allocated.
+- **Through the memory:** `send` is one call of any size, for `host = :wasi` and `host = :js`
+  (with WasmCodegen's `js/julia.mjs`: `instantiate(bytes, { imports: page.imports })`).
+  WasmCodegen copies a `Vector{UInt8}` or `String` argument of a declared import to the linear
+  memory and passes its offset and length. `receive` and `poll` copy the host's message in
+  through WasmCodegen's staging area (`Runtime.Staging`), in chunks of at most 1 MiB, so they
+  are for `host = :wasi` only: WasmCodegen's bytes arguments go from the module to the host, and
+  a module for JavaScript that calls them doesn't compile.
+- **Hosts:** Node 24 or newer, or Bun 1.4 or newer (tested with Node 24 and 26 and Bun 1.4).
+  No JSPI and no flags are needed, because the page functions don't suspend. `page.mjs` uses no
+  Node API, so a browser should work too, but none has been tested.
+- **Natively** there is no page: `send` keeps a copy in `Page.native_outbox()`, and `receive`
+  takes from `Page.native_inbox()`, which a test fills.
+- **Not for suspended calls:** with `Config(tasks = :jspi)`, a task that sends while another
+  is suspended inside a `wasm_host_page` call isn't supported. The functions don't suspend, and
+  Staging's scopes assume one synchronous call stack.
+
+### Pushing instead of pulling
+
+A module without a way to pass bytes leaves the page to pull a message out through an export,
+4 bytes per call: the tyler-map demo (JuliaWASM/demos) reads WGLMakie's MsgPack updates with
+`msg_word(i, j)`. `Page.send` pushes the message in one call instead. Per 1 KiB message, with
+`wasm-opt -O3`, Node 24 on aarch64 (`test/e2e/prun.mjs`):
+
+| | µs per 1 KiB message |
+|---|---|
+| pulled, 256 calls of a 4-byte export | ~22 |
+| `Page.send` (`:wasi` / `:js`) | 1.4 / 1.3 (Node 26: 1.3 / 1.2; Bun 1.4: 1.2 / 1.0) |
+
+To migrate:
+- the program calls `WasmHost.Page.send(take!(io))` where it queued a message for `msg_word`;
+- the page delivers in `onMessage` (`Bonito.process_message(Bonito.decode_binary(bytes, …))`)
+  instead of looping over `msg_word`;
+- the export calls that pulled go away, as does the queue they read (`clear_msgs!`).
 
 ## Requirements
 
 - Julia 1.12 or 1.13.
-- A WasmCodegen with WASI support for `Config(host = :wasi)`: the filesystem and the environment
-  (`ENV`). At the time of writing these are open pull requests on gbaraldi/WasmCodegen.jl, and
-  upstream `main` doesn't have them yet.
-- Node 22 or newer for the Node adapter (22.15 or newer for zstd), with JavaScript Promise
-  Integration for the `jspi` mode (`--experimental-wasm-jspi` where it isn't on by default).
+- A WasmCodegen with WASI support for `Config(host = :wasi)`: the filesystem and the
+  environment (`ENV`). Upstream `main` has both.
+- Node 24 or newer for the Node adapter, or Bun. The `jspi` mode needs JavaScript Promise
+  Integration (`WebAssembly.Suspending` and `WebAssembly.promising`), which Node 24 and later
+  have without a flag. (Node 22 has only the older JSPI API, behind a flag the adapter
+  doesn't use, and Node 26 rejects the flag: don't pass it.)
 - For the browser adapter: a browser with JSPI (Chrome or Edge 137+) and
   [`@bjorn3/browser_wasi_shim`](https://github.com/bjorn3/browser_wasi_shim) (tested: 0.4.2).
 
@@ -160,16 +226,16 @@ using WasmCodegen, Downloads, WasmHost      # loading all three loads the extens
 include("myprogram.jl")                     # defines main()::Int32, which uses Downloads
 
 c = WasmCodegen.compile([WasmCodegen.Entry(main, (); name = "main")];
-                        config = WasmCodegen.Config(host = :wasi, verify = :warn))
+                        config = WasmCodegen.Config(host = :wasi, verify = :error))
 write("main.wasm", c.bytes)
 ```
 
-**`verify = :error` doesn't pass yet** for programs that use the Downloads extension.
-WasmCodegen's trim verifier checks the code native inference produces. Native inference
-inlines Downloads' own `request(url)` before WasmCodegen's overlay table is consulted, so the
-verifier reports errors in native code (libcurl's `easy_hook`) that the module never compiles.
-The module itself is clean: 0 unsupported constructs with `trim = :safe`. Use `verify = :warn`
-(the default) until WasmCodegen's verifier checks overlaid methods.
+**`verify = :error` passes** for programs that use the Downloads extension: WasmCodegen's trim
+verifier checks overlaid methods with the module's own inference
+([gbaraldi/WasmCodegen.jl#60](https://github.com/gbaraldi/WasmCodegen.jl/pull/60)). The
+end-to-end test builds its `fetch` program with `verify = :error`, in both transports; its
+`decompress` program, which isn't built in CI (it needs the removed `julia_regex` host
+extension), still uses `:warn`.
 
 **The import transport:** also define `WasmHost.transport() = :import` before compiling, and
 pass `import_libraries = ["wasm_host"]` to `Config`. `transport` is a function rather than a
@@ -207,7 +273,7 @@ protocols in `js/common/`. See [`js/README.md`](js/README.md).
 
 | Host | Future package | Downloads | Decompression | Platform tags | Waiting | Tested? |
 |---|---|---|---|---|---|---|
-| **Node** 22+ (`node:wasi`) | `@wasmhost/node` (`js/node/`) | spool (`spool.mjs`), import (`imports.mjs`) | spool: gzip, deflate; zstd on 22.15+ | detected arch, os, libc + overrides | JSPI; sync worker (spool) | **Yes:** spool in both modes; import only with a local WasmCodegen that has the upstream change |
+| **Node** 24+ (`node:wasi`) | `@wasmhost/node` (`js/node/`) | spool (`spool.mjs`), import (`imports.mjs`) | spool: gzip, deflate, zstd | detected arch, os, libc + overrides | JSPI; sync worker (spool) | **Yes** (CI, with Bun 1.4): spool in both modes; import |
 | **Browsers** with JSPI (Chrome/Edge 137+) | `@wasmhost/browser` (`js/browser/`), on `@bjorn3/browser_wasi_shim` | spool (`spool.mjs`), import (`imports.mjs`); bodies in the shim's in-memory filesystem | spool: `DecompressionStream`: gzip, deflate; zstd where the browser has it | none to detect | JSPI only; one call at a time per module (`promisingExports`); a re-entrant call poisons the instance (make a new one) | **Yes:** spool and import in headless Chromium 158 (Playwright), against native; decompression: the adapter alone. The browser's User-Agent replaces the program's, and CORS applies: see [`js/browser/README.md`](js/browser/README.md) |
 | **workerd** | – | import fits; no filesystem | `DecompressionStream` | – | JSPI, if available | **No** (`js/workerd/`) |
 | **wasmtime** | – | CLI: no (needs a helper process and polling); import from an embedding | the embedding's | the embedding's | the embedding's | **No** (`js/wasmtime/`) |
@@ -217,15 +283,16 @@ protocols in `js/common/`. See [`js/README.md`](js/README.md).
 - **`WasmCodegen.Runtime.WASM_METHODS`:** WasmCodegen's internal mechanism today, and how its
   own runtime replaces methods. (`@wasm_method` is `Base.Experimental.@overlay` on it.) It isn't
   yet a supported interface for packages; that is being asked upstream.
-- **`WasmCodegen.Runtime.Staging`:** used by the import transport only.
+- **`WasmCodegen.Runtime.Staging`:** used by the import transport and by `Page.receive`.
 
 Expect to update this package when either changes.
 
 ## Tests
 
-- `test/runtests.jl`: native tests of the three modules and their protocols, and of the Node
+- `test/runtests.jl`: native tests of the modules and their protocols (`Page`'s native queues), and of the Node
   adapter's parts when `node` is on `PATH` (the protocol round trip, decompression with
-  `node:zlib`, platform tags against the native `HostPlatform()`). Run them with `Pkg.test()`.
+  `node:zlib`, platform tags against the native `HostPlatform()`, the page adapter on a memory
+  of its own). Run them with `Pkg.test()`.
 - `test/e2e/e2e.jl`: compiles programs with WasmCodegen and runs them in Node.
   - `spool`, `import`: `test/e2e/prog.jl` (plain Downloads calls: an `IOBuffer` body, a 3 MiB
     file, a redirect with a custom header, HEAD, POST, a 404, a refused connection,
@@ -236,13 +303,18 @@ Expect to update this package when either changes.
     (`get_extract_cmd`: 7z, zstd) give, whose tree hash is the artifact's. Error cases, and
     the platform lines against the native run.
 
+  - `page`: `test/e2e/pprog.jl` sends patterns of 0, 1, 7, 1 KiB, 64 KiB and 1 MiB + 1 bytes
+    and UTF-8 strings (up to 1.2 MB), and sends back what the host posts (`prun.mjs`). Its
+    output and the messages the host receives must equal the native run's (`pnative.jl`). It
+    runs for WASI, then for JavaScript (sending only).
   - `WASM_RUNTIME=chromium`: the browser adapter in Playwright's headless Chromium
     (`test/e2e/browser/`; `npm ci` and `npx playwright install chromium` there first). spool and
     import as above, the test resources on another origin than the page (CORS); the User-Agent
-    the server echoes must be the browser's. `decompress`: the adapter's decompression alone.
+    the server echoes must be the browser's. `decompress`: the adapter's decompression alone. `page` isn't run
+    there.
 
   ```
-  julia test/e2e/e2e.jl /path/to/WasmCodegen.jl [spool|import|decompress|all]
+  julia test/e2e/e2e.jl /path/to/WasmCodegen.jl [spool|import|decompress|page|all]
   ```
 
 ## License

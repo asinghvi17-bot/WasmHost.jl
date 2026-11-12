@@ -229,4 +229,69 @@ const NOSPOOL = ("WASMHOST_SPOOL" => nothing, "WASM_FETCH_SPOOL" => nothing)
             end
         end
     end
+
+    @testset "Page: natively" begin
+        P = WasmHost.Page
+        empty!(P.native_outbox()); empty!(P.native_inbox())
+        v = UInt8[1, 2, 3]
+        @test P.send(v) === nothing
+        v[1] = 0x09   # (a copy was kept)
+        P.send("αβ")
+        P.send(UInt8[])
+        @test P.native_outbox() == [UInt8[1, 2, 3], Vector{UInt8}(codeunits("αβ")), UInt8[]]
+        @test P.receive() === nothing
+        push!(P.native_inbox(), UInt8[7], UInt8[], UInt8[8, 9])
+        @test P.receive() == UInt8[7]
+        seen = Vector{UInt8}[]
+        @test P.poll(m -> push!(seen, m)) == 2
+        @test seen == [UInt8[], UInt8[8, 9]] && P.receive() === nothing && P.poll(identity) == 0
+        empty!(P.native_outbox())
+    end
+
+    # the page adapter's imports as a module calls them, on a memory of its own: messages sent,
+    # posted messages read in chunks, and the errors
+    @testset "JavaScript: page adapter" begin
+        if node === nothing
+            @test_skip "$runtime not found"
+        else
+            script = """
+            import { makePage, LIBRARY } from $(js("common", "page.mjs"));
+            const memory = new WebAssembly.Memory({ initial: 1 });
+            const mem = new Uint8Array(memory.buffer);
+            const got = [];
+            let views = 0;
+            const page = makePage({ onMessage: (b) => { views += b.buffer === memory.buffer; got.push(Array.from(b)); } });
+            page.bindMemory(memory);
+            const { send, pending, read, pop } = page.imports[LIBRARY];
+            mem.set([1, 2, 3, 4, 5], 100);
+            send(100, 3);                          // a view of the memory
+            send(100, 5);
+            send(0, 0);                            // empty
+            page.post('αβ'); page.post(new Uint8Array([9, 8, 7, 6])); page.post(new ArrayBuffer(0));
+            const out = [pending()];
+            read(200, 0, 2); read(202, 2, 2); pop();
+            out.push(Array.from(mem.subarray(200, 204)), pending());
+            read(300, 1, 3); pop();
+            out.push(Array.from(mem.subarray(300, 303)), pending()); pop();
+            out.push(pending(), page.queued());
+            const errs = [];
+            page.post(new Uint8Array(2));
+            for (const f of [() => read(0, 1, 2), () => pop(), () => read(0, 0, 1), () => pop(), () => page.post(42)]) { try { f(); errs.push('none'); } catch (e) { errs.push(e.constructor.name); } }
+            // (an exception of onMessage goes to onError, not to the module)
+            const caught = [];
+            const failing = makePage({ memory, onMessage: () => { throw new Error('boom'); }, onError: (e, b) => caught.push([e.message, b.length]) });
+            let threw = false;
+            try { failing.imports[LIBRARY].send(100, 3); } catch { threw = true; }
+            process.stdout.write(JSON.stringify({ got, views, out, errs, stats: page.stats, caught, threw, errors: failing.stats.errors }));
+            """
+            r = read(`$node --input-type=module -e $script`, String)
+            @test occursin("\"got\":[[1,2,3],[1,2,3,4,5],[]]", r)
+            @test occursin("\"views\":3", r)   # (each message is a view of the memory)
+            @test occursin("\"out\":[4,[206,177,206,178],4,[8,7,6],0,-1,0]", r)
+            # (past the end, then fine; then nothing pending; a message of the wrong kind)
+            @test occursin("\"errs\":[\"RangeError\",\"none\",\"Error\",\"Error\",\"TypeError\"]", r)
+            @test occursin("\"stats\":{\"sent\":3,\"sentBytes\":8,\"received\":4,\"receivedBytes\":10,\"errors\":0}", r)
+            @test occursin("\"caught\":[[\"boom\",3]],\"threw\":false,\"errors\":1", r)
+        end
+    end
 end

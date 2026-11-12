@@ -1,6 +1,6 @@
 // Engine-neutral use of a `node:wasi` instance: Node's and Bun's `node:wasi` differ.
 //
-// | | Node (22+) | Bun (1.x) |
+// | | Node (24+) | Bun (1.x) |
 // |---|---|---|
 // | `wasiImport` | yes | yes |
 // | `getImportObject()` | yes | no |
@@ -36,6 +36,6 @@ export function wasiInitialize(wasi, instance) {
 export function jspiGap() {
   if (typeof WebAssembly.Suspending === 'function' && typeof WebAssembly.promising === 'function') return null;
   const engine = runtime === 'bun' ? `Bun ${globalThis.Bun.version} (JavaScriptCore)` :
-    runtime === 'node' ? `Node ${process.version} (V8 ${process.versions.v8}; Node 22: --experimental-wasm-jspi)` : 'this engine';
+    runtime === 'node' ? `Node ${process.version} (V8 ${process.versions.v8}; needs Node 24+)` : 'this engine';
   return `JSPI (WebAssembly.Suspending/promising): not in ${engine}`;
 }

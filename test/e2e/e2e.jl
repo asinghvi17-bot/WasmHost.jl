@@ -1,7 +1,7 @@
 # End-to-end checks: compile a program with WasmCodegen, run it in Node, Bun or a headless Chromium with WasmHost's
 # adapter, and compare it with native.
 #
-#   julia test/e2e/e2e.jl /path/to/WasmCodegen.jl [spool|import|decompress|all]
+#   julia test/e2e/e2e.jl /path/to/WasmCodegen.jl [spool|import|decompress|page|all]
 #
 # - spool, import: test/e2e/prog.jl (plain Downloads calls) against a local HTTP server
 #   (server.mjs). Its output and downloaded bytes must equal the same program run natively
@@ -10,6 +10,9 @@
 #   artifact tarball, gzip and zstd as the Pkg server serves it (and deflate). The decompressed
 #   bytes must equal what native Pkg's own decompressors give (`get_extract_cmd`: 7z, zstd),
 #   whose tree hash is the artifact's; the platform lines must equal the native run's.
+# - page: test/e2e/pprog.jl (WasmHost.Page) for WASI, both directions, with the page adapter
+#   (js/common/page.mjs, prun.mjs): its output and the messages it sends must equal the native
+#   run's (pnative.jl). Then for JavaScript (`host = :js`, sending only).
 #
 # - WASM_RUNTIME=chromium: the browser adapter (js/browser/) in Playwright's headless Chromium, driven by Node
 #   (test/e2e/browser/: `npm ci` and `npx playwright install chromium` there first). spool and import as above, with
@@ -20,7 +23,7 @@
 #   module behind the queue (reentry.mjs: the instance is poisoned).
 #
 # Environment: JULIA (default: this julia), WASM_RUNTIME (node, the default, bun or chromium), NODE (default: `node` on PATH,
-# Node 22+ with JSPI; zstd needs 22.15+) or BUN (default: `bun` on PATH), WASMBUILDER / IRSTRUCTURIZER (paths, optional: otherwise WasmCodegen's own
+# Node 24+, which has JSPI) or BUN (default: `bun` on PATH), WASMBUILDER / IRSTRUCTURIZER (paths, optional: otherwise WasmCodegen's own
 # [sources]), E2E_REUSE=1 (run modules an earlier run built, without rebuilding them),
 # E2E_ARTIFACTS (a directory with ARTIFACT.tar.gz and ARTIFACT.tar.zst, instead of downloading
 # them from pkg.julialang.org).
@@ -39,7 +42,8 @@ runtime = get(ENV, "WASM_RUNTIME", "node")
 runtime in ("node", "bun", "chromium") || error("WASM_RUNTIME must be node, bun or chromium, not $(repr(runtime))")
 const BROWSER = runtime == "chromium"
 driver = BROWSER ? "node" : runtime
-node = get(ENV, uppercase(driver), something(Sys.which(driver), driver))
+node = something(get(ENV, uppercase(driver), nothing), Sys.which(driver), Some(nothing))
+node === nothing && error("$driver is not on PATH: install it (Node 24+ or Bun) or set $(uppercase(driver)) to its path")
 work = mkpath(joinpath(HERE, "work"))
 
 # a real artifact (Bzip2_jll's binaries for aarch64-linux-gnu; any artifact works): its tree hash
@@ -86,7 +90,8 @@ function output(cmd)
     return out
 end
 
-const NODE_FLAGS = runtime == "node" ? `--experimental-wasm-jspi --disable-warning=ExperimentalWarning` : ``
+# (JSPI needs no flag: it is on by default in Node 24+, and Node 26 rejects --experimental-wasm-jspi as a "bad option")
+const NODE_FLAGS = runtime == "node" ? `--disable-warning=ExperimentalWarning` : ``
 
 function build(env, wasm, transport, program)
     get(ENV, "E2E_REUSE", "") == "1" && isfile(wasm) && return
@@ -220,11 +225,30 @@ function decompression(env)
     return ok
 end
 
-# (the browser's decompress part compiles nothing)
+# page messages: for WASI, then for JavaScript (sending only); in Node or Bun (prun.mjs), not in a browser
+function page(env)
+    native = output(`$julia --startup-file=no --project=$env $(joinpath(HERE, "pnative.jl"))`)
+    print("native:\n", native)
+    want(prefix) = lines(native, prefix)
+    ok = occursin("page check: true", native)
+    for host in ("wasi", "js")
+        wasm = joinpath(work, "page-$host.wasm")
+        build(env, wasm, host, "page")
+        out = output(`$node $(joinpath(HERE, "prun.mjs")) $wasm $host $(joinpath(wcg, "js", "julia.mjs"))`)
+        same = occursin("page check: true", out) && lines(out, "S") == want("S") && lines(out, "U") == want("U") &&
+               (host == "js" || lines(out, "R") == want("R"))
+        println("== page/$host: ", same ? "IDENTICAL to native" : "DIFFERENT", "\n", out)
+        ok &= same
+    end
+    return ok
+end
+
+# (the browser's decompress part compiles nothing; the page part has no browser runner)
+BROWSER && which == "page" && error("e2e page: not in chromium (WasmHost.Page is tested in Node and Bun only)")
 env = BROWSER && which == "decompress" ? nothing : setup_env(joinpath(work, "env"))
 ok = true
-for part in (which == "all" ? ["spool", "import", "decompress"] : [which])
-    global ok &= part == "decompress" ? decompression(env) : downloads(env, part)
+for part in (which == "all" ? ["spool", "import", "decompress", (BROWSER ? () : ("page",))...] : [which])
+    global ok &= part == "decompress" ? decompression(env) : part == "page" ? page(env) : downloads(env, part)
 end
 println(ok ? "E2E PASS" : "E2E FAIL")
 exit(ok ? 0 : 1)
