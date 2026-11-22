@@ -9,7 +9,8 @@ performed by the JavaScript host around the module. Natively nothing changes.
 | `WasmHost.Downloads` | HTTP requests with the host's `fetch` (TLS, redirects and proxies are the host's) | plain `Downloads.download` / `Downloads.request`, through the package extension |
 | `WasmHost.Decompress` | gzip, deflate and zstd decompression of a file by the host | `WasmHost.Decompress.decompress(src, dst)` |
 | `WasmHost.Platform` | the host's platform tags (arch, os, libc, ...) from the WASI environment | `WasmHost.Platform.host_platform()` |
-| `WasmHost.Page` | messages (bytes) between the program and the JavaScript around it: a page, a worker, a Node script | `WasmHost.Page.send(bytes)`, `receive()`, `poll(f)`, through the package extension |
+| `WasmHost.Page` | messages (bytes) between the program and the JavaScript around it: a page, a worker, a Node script | `WasmHost.Page.send(bytes)`, `receive()`, `poll(f)`, `wait_message()`, through the package extension |
+| `WasmHost.Bridge` | values on `Page`, both ways: browser events into a Julia task, evaljs-style messages out, a request that waits for the page's answer (a pick) | `WasmHost.Bridge.send(x)`, `recv()`, `serve(f)`, `ask(request)`, `close()`; `docs/bridge.md` |
 
 ```julia
 using Downloads
@@ -148,6 +149,7 @@ program and the page: a plot's MsgPack update, JSON, text.
 WasmHost.Page.send(bytes)         # a Vector{UInt8} or a String: the page's onMessage gets the bytes
 WasmHost.Page.receive()           # the page's next posted message (a Vector{UInt8}), or nothing
 WasmHost.Page.poll(f)             # f(bytes) for each posted message; how many there were
+WasmHost.Page.wait_message()      # (a Julia task, julia_io) parked until the page posts; Page.wake() ends it
 ```
 
 ```js
@@ -181,9 +183,41 @@ page.post(new TextEncoder().encode('{"zoom": 3}'));   // read by the program's n
   Node API, so a browser should work too, but none has been tested.
 - **Natively** there is no page: `send` keeps a copy in `Page.native_outbox()`, and `receive`
   takes from `Page.native_inbox()`, which a test fills.
+- **Waiting** (`wait_message`): a program compiled with `tasks = :jspi` and
+  `host_extensions = [:julia_io]`, and a page made with `makePage({ events })` (WasmCodegen's
+  `js/julia_io.mjs` events, the module's `julia_io` imports). The `wait` import returns a
+  `julia_io` external handle, and the page's `post` makes it ready: the task is parked as for a
+  timer, the others run, and nothing calls into the module. `Page.wake()` (another task) ends
+  the wait.
+- **Hooks for a layer above** (`WasmHost.Bridge`): `makePage({ source })`, where messages come
+  from when nothing posted is queued (the layer keeps its own queue, `notify()` when it has one
+  again), and `makePage({ guard })`, called first in every import (a browser adapter's re-entry
+  check).
 - **Not for suspended calls:** with `Config(tasks = :jspi)`, a task that sends while another
-  is suspended inside a `wasm_host_page` call isn't supported. The functions don't suspend, and
-  Staging's scopes assume one synchronous call stack.
+  is suspended inside a `wasm_host_page` call isn't supported. The functions don't suspend (a
+  waiting task is suspended in `julia_io`'s `poll`, not in them), and Staging's scopes assume one
+  synchronous call stack.
+
+### Bridge
+
+`WasmHost.Bridge` is values on `Page`: a codec (JSON with typed arrays in a blob region), a
+receiving task (`serve`), requests that wait for the page's answer (`ask`), a bounded queue on
+the page, and a close from either side. See `docs/bridge.md`.
+
+```julia
+const B = WasmHost.Bridge
+B.send(Dict{String,Any}("msg_type" => "2", "payload" => payload))   # module -> page
+t = @async B.serve(msg -> handle(msg))        # page -> module: parked while there are none
+answer = B.ask(Dict{String,Any}("op" => "pick", "x" => 3))          # (from another task)
+```
+
+```js
+import { makeBridge } from './WasmHost.jl/js/common/bridge.mjs';   // (or js/node/, js/browser/bridge.mjs)
+const bridge = makeBridge({ events, onMessage: (v) => ..., onAsk: async (request) => answer });
+const inst = await WebAssembly.instantiate(mod, { ...wasiImports, ...bridge.imports, julia_io: { ...events.imports, ... } });
+bridge.bindMemory(inst.exports.memory);
+bridge.post({ msg_type: '0', id, payload });
+```
 
 ### Pushing instead of pulling
 
@@ -281,6 +315,9 @@ protocols in `js/common/`. See [`js/README.md`](js/README.md).
   own runtime replaces methods. (`@wasm_method` is `Base.Experimental.@overlay` on it.) It isn't
   yet a supported interface for packages; that is being asked upstream.
 - **`WasmCodegen.Runtime.Staging`:** used by the import transport and by `Page.receive`.
+- **`WasmCodegen.Runtime.Host.await_handle`, `Host.close`, `JuliaIO.cancel`:** `Page.wait_message`
+  and `Page.wake`. A task parked on a handle (not the whole module) needs WasmCodegen's Julia
+  tasks on `julia_io` (asinghvi17-bot/WasmCodegen.jl `feat/task-park-host-wait`).
 
 Expect to update this package when either changes.
 
@@ -304,9 +341,13 @@ Expect to update this package when either changes.
     and UTF-8 strings (up to 1.2 MB), and sends back what the host posts (`prun.mjs`). Its
     output and the messages the host receives must equal the native run's (`pnative.jl`). It
     runs for WASI, then for JavaScript (sending only).
+  - `bridge`: `test/e2e/brprog.jl` (`WasmHost.Bridge`, Julia tasks, `verify = :error`), each case
+    driven by the page's side (`bdrive.mjs`): the codec, events in order, the queue overflowing,
+    asks answered out of order, a failed ask, a pick, and closing from either side. Node only; it
+    needs WasmCodegen's tasks on `julia_io` (`feat/task-park-host-wait`).
 
   ```
-  julia test/e2e/e2e.jl /path/to/WasmCodegen.jl [spool|import|decompress|page|all]
+  julia test/e2e/e2e.jl /path/to/WasmCodegen.jl [spool|import|decompress|page|bridge|all]
   ```
 
 ## License

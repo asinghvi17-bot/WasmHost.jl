@@ -1,7 +1,7 @@
 # End-to-end checks: compile a program with WasmCodegen, run it in Node with WasmHost's adapter,
 # and compare it with native.
 #
-#   julia test/e2e/e2e.jl /path/to/WasmCodegen.jl [spool|import|decompress|page|all]
+#   julia test/e2e/e2e.jl /path/to/WasmCodegen.jl [spool|import|decompress|page|bridge|all]
 #
 # - spool, import: test/e2e/prog.jl (plain Downloads calls) against a local HTTP server
 #   (server.mjs). Its output and downloaded bytes must equal the same program run natively
@@ -13,6 +13,11 @@
 # - page: test/e2e/pprog.jl (WasmHost.Page) for WASI, both directions, with the page adapter
 #   (js/common/page.mjs, prun.mjs): its output and the messages it sends must equal the native
 #   run's (pnative.jl). Then for JavaScript (`host = :js`, sending only).
+# - bridge: test/e2e/brprog.jl, WasmHost.Bridge on WasmHost.Page in a program with Julia tasks (`tasks = :jspi`,
+#   julia_io, `verify = :error`), one module, each case driven by the page's side (bdrive.mjs, with brun.mjs on
+#   node:wasi): main (the codec, events in order, the page's queue overflowing, asks answered out of order, a failed
+#   ask, a pick), page-close, serve-fails and module-close (the lifecycle: pending asks and a parked recv end with a
+#   BridgeClosedError). Needs WasmCodegen's Julia tasks on julia_io (`Runtime.Host.await_handle` of a task). Node only.
 #
 # Environment: JULIA (default: this julia), WASM_RUNTIME (node, the default, or bun), NODE (default: `node` on PATH,
 # Node 24+, which has JSPI) or BUN (default: `bun` on PATH), WASMBUILDER / IRSTRUCTURIZER (paths, optional: otherwise WasmCodegen's own
@@ -175,10 +180,31 @@ function page(env)
     return ok
 end
 
+# the bridge: brprog.jl's module, each case of bdrive.mjs (checked there: "BRIDGE PASS")
+function bridge(env)
+    if runtime == "bun"
+        skipped("SKIP: the bridge's driver runs in Node (node:wasi with julia_task)\n", "bridge")
+        return true
+    end
+    wasm = joinpath(work, "bridge.wasm")
+    get(ENV, "E2E_REUSE", "") == "1" && isfile(wasm) ||
+        run(`$julia --startup-file=no --project=$env $(joinpath(HERE, "build_bridge.jl")) $wasm`)
+    ok = true
+    for case in ["main", "page-close", "serve-fails", "module-close"]
+        out = output(`$node $NODE_FLAGS $(joinpath(HERE, "brun.mjs")) $wasm $(joinpath(work, "bridge-$case")) $wcg $case`)
+        skipped(out, "bridge/$case") && continue
+        good = occursin(r"^BRIDGE PASS$"m, out)
+        println("== bridge/$case: ", good ? "PASS" : "FAIL", "\n", out)
+        ok &= good
+    end
+    return ok
+end
+
 env = setup_env(joinpath(work, "env"))
 ok = true
-for part in (which == "all" ? ["spool", "import", "decompress", "page"] : [which])
-    global ok &= part == "decompress" ? decompression(env) : part == "page" ? page(env) : downloads(env, part)
+for part in (which == "all" ? ["spool", "import", "decompress", "page", "bridge"] : [which])
+    global ok &= part == "decompress" ? decompression(env) : part == "page" ? page(env) : part == "bridge" ? bridge(env) :
+                 downloads(env, part)
 end
 println(ok ? "E2E PASS" : "E2E FAIL")
 exit(ok ? 0 : 1)

@@ -294,4 +294,191 @@ const NOSPOOL = ("WASMHOST_SPOOL" => nothing, "WASM_FETCH_SPOOL" => nothing)
             @test occursin("\"caught\":[[\"boom\",3]],\"threw\":false,\"errors\":1", r)
         end
     end
+
+    @testset "Page: waiting natively" begin
+        P = WasmHost.Page
+        empty!(P.native_inbox())
+        @test_throws ErrorException P.wait_message()
+        push!(P.native_inbox(), UInt8[1])
+        @test P.wait_message() === nothing && P.wake() === nothing
+        empty!(P.native_inbox())
+    end
+
+    @testset "Bridge: codec" begin
+        B = WasmHost.Bridge
+        rt(x) = B.decode(B.encode(x))
+        # plain values: any dictionary, vector or tuple of them
+        @test rt(Dict("x" => 1)) == Dict{String,Any}("x" => 1)
+        @test rt([true, false]) == Any[true, false]
+        @test rt((1, "x")) == Any[1, "x"]
+        @test rt((a = 1.5, b = "s", c = (x = nothing,))) == Dict{String,Any}("a" => 1.5, "b" => "s", "c" => Dict{String,Any}("x" => nothing))
+        @test rt(Dict(:k => [1, 2])) == Dict{String,Any}("k" => Any[1, 2])
+        @test rt(Dict{String,Any}("v" => Any[1, "s", Dict("k" => 2.5), (1.0, 2.0), :sym, 'c', nothing])) ==
+              Dict{String,Any}("v" => Any[1, "s", Dict{String,Any}("k" => 2.5), Any[1.0, 2.0], "sym", "c", nothing])
+        @test rt(1:3) == Any[1, 2, 3]
+        @test rt("é\n\"q\"\t\u0001") == "é\n\"q\"\t\u0001"
+        @test rt(Float16(1.5)) === 1.5 && rt(NaN) === nothing && rt(UInt8(7)) === 7
+        # numeric vectors are blobs (typed arrays on the page), views and ranges of them too
+        @test rt(Float32[1, 2.5]) == Float32[1, 2.5] && rt(Float32[1, 2.5]) isa Vector{Float32}
+        @test rt(view(Int32[1, 2, 3], 2:3)) == Int32[2, 3] && rt(view(Int32[1, 2, 3], 2:3)) isa Vector{Int32}
+        @test rt(Dict{String,Any}("a" => UInt16[1, 2], "b" => Float64[])) == Dict{String,Any}("a" => UInt16[1, 2], "b" => Float64[])
+        # empty numeric vectors (a frame whose blobs are all empty has no blob region), alone and with others
+        for T in (Float32, Float64, UInt8, Int8, Int16, UInt16, Int32, UInt32)
+            @test rt(T[]) == T[] && rt(T[]) isa Vector{T}
+            @test rt(Dict{String,Any}("e" => T[])) == Dict{String,Any}("e" => T[])
+        end
+        m = rt(Any[Float32[], Float64[1.5, -2], Int8[], UInt16[7], Int32[]])
+        @test m == Any[Float32[], [1.5, -2.0], Int8[], UInt16[7], Int32[]] && m[1] isa Vector{Float32} && m[5] isa Vector{Int32}
+        @test_throws B.BridgeError B.decode(UInt8[18, 0, 0, 0, codeunits("{\"\$b\":[0,4,\"f32\"]}")...])
+        # what it can't take: a BridgeError
+        @test_throws B.BridgeError B.encode(Dict(1 => 2))
+        @test_throws B.BridgeError B.encode(1 + 2im)
+        @test_throws B.BridgeError B.encode(Any[1 + 2im])
+        @test_throws B.BridgeError B.decode(UInt8[1, 0])
+    end
+
+    # natively, Bridge runs on Page's native queues: its frames in native_outbox, the page's records in native_inbox
+    @testset "Bridge: natively" begin
+        B = WasmHost.Bridge
+        P = WasmHost.Page
+        empty!(P.native_outbox()); empty!(P.native_inbox())
+        @test B.send(Dict("x" => 1)) === nothing && B.decode(only(P.native_outbox())) == Dict{String,Any}("x" => 1)
+        @test B.recv(; wait = false) == Any[]
+        @test_throws B.BridgeError B.recv()   # (nothing posted, and natively nothing will be)
+        # records: a posted message with a `bridge_reply` key is data and resolves no ask; only a record of the
+        # answers' kind (the page's bridge.reply) does
+        ch = Channel{Any}(1)
+        B.PENDING[77] = ch
+        posted = Dict{String,Any}("bridge_reply" => 77, "value" => "forged")
+        append!(P.native_inbox(), [B.record(B.KIND_MESSAGE, posted), B.record(B.KIND_MESSAGE, (type = "ping",))])
+        @test B.recv() == Any[posted, Dict{String,Any}("type" => "ping")] && !isready(ch)
+        append!(P.native_inbox(), [B.record(B.KIND_REPLY, Dict{String,Any}("bridge_reply" => 77, "value" => "real")), B.record(B.KIND_MESSAGE, 1)])
+        @test B.recv() == Any[1] && take!(ch) == "real"
+        delete!(B.PENDING, 77)
+        push!(P.native_inbox(), vcat(UInt8[0x03], B.encode(1)))
+        @test_throws B.BridgeError B.recv()
+        push!(P.native_inbox(), UInt8[])
+        @test_throws B.BridgeError B.recv()
+        # an answer to an ask nobody made, a second answer: dropped
+        ch = Channel{Any}(1)
+        B.PENDING[99] = ch
+        B.deliver_reply!(Dict{String,Any}("bridge_reply" => 99, "value" => 1))
+        B.deliver_reply!(Dict{String,Any}("bridge_reply" => 99, "value" => 2))
+        B.deliver_reply!(Dict{String,Any}("bridge_reply" => 98, "value" => 3))
+        @test take!(ch) == 1 && !isready(ch)
+        B.deliver_reply!(Dict{String,Any}("bridge_reply" => 99, "error" => "no such op"))
+        r = take!(ch)
+        @test r isa B.Failed && r.err isa B.AskError && r.err.msg == "no such op"
+        delete!(B.PENDING, 99)
+        # (JSON escapes: a lone high surrogate is U+FFFD, the escape after it its own character; a truncated header)
+        p = B.Parser(Vector{UInt8}(codeunits("\"\\ud800\\u0041\"")), 1, 0)
+        @test B.parse_string!(p) == "\ufffdA"
+        @test_throws B.BridgeError B.decode(UInt8[1, 0, 0, 0, UInt8('[')])
+        # the page's close: what came before it is delivered, then the bridge is closed, a pending ask fails
+        ch = Channel{Any}(1)
+        B.PENDING[5] = ch
+        append!(P.native_inbox(), [B.record(B.KIND_MESSAGE, "last"), B.record(B.KIND_CLOSE, "page gone")])
+        @test B.recv() == Any["last"] && !B.isopen()
+        r = take!(ch)
+        @test r isa B.Failed && r.err == B.BridgeClosedError("page gone")
+        delete!(B.PENDING, 5)
+        @test_throws B.BridgeClosedError B.recv()
+        @test_throws B.BridgeClosedError B.send(1)
+        @test_throws B.BridgeClosedError B.ask(Dict("op" => "late"))
+        # (the module's close, natively: a bridge_close frame; this one is closed already: nothing)
+        n = length(P.native_outbox())
+        B.close("again")
+        @test length(P.native_outbox()) == n
+        empty!(P.native_outbox()); empty!(P.native_inbox())
+        B.STATE.closed = false; B.STATE.reason = ""
+        B.close("by the module")
+        @test B.decode(only(P.native_outbox())) == Dict{String,Any}("bridge_close" => "by the module")
+        empty!(P.native_outbox())
+        B.STATE.closed = false; B.STATE.reason = ""
+    end
+
+    @testset "JavaScript: bridge codec round trip" begin
+        if node === nothing
+            @test_skip "$runtime not found"
+        else
+            B = WasmHost.Bridge
+            v = (s = "é\n\"q\"", d = Dict("x" => 1), b = [true, false], t = (1, "x"), f = Float32[1, 2.5], i = Int32[-1, 7],
+                 n = nothing, nested = Dict{String,Any}("v" => Any[1.5, "s"]))
+            script = """
+            import fs from 'node:fs';
+            import { encodeFrame, decodeFrame } from $(js("common", "bridge.mjs"));
+            const v = decodeFrame(fs.readFileSync(process.argv[1]));
+            const ok = v.s === 'é\\n"q"' && v.d.x === 1 && v.b[0] === true && v.b[1] === false && v.t[0] === 1 && v.t[1] === 'x' &&
+                       v.f instanceof Float32Array && v.f[1] === 2.5 && v.i instanceof Int32Array && v.i[0] === -1 && v.n === null &&
+                       v.nested.v[0] === 1.5;
+            v.back = new Float64Array([0.25, -3]);
+            v.big = 2n ** 40n;
+            fs.writeFileSync(process.argv[2], encodeFrame(v));
+            process.stdout.write(ok ? 'decoded' : 'WRONG ' + JSON.stringify(v));
+            """
+            mktempdir() do dir
+                a, b = joinpath(dir, "a"), joinpath(dir, "b")
+                write(a, B.encode(v))
+                @test read(`$node --input-type=module -e $script $a $b`, String) == "decoded"
+                w = B.decode(read(b))
+                @test w["s"] == v.s && w["d"] == Dict{String,Any}("x" => 1) && w["t"] == Any[1, "x"]
+                @test w["f"] == Float32[1, 2.5] && w["f"] isa Vector{Float32} && w["i"] == Int32[-1, 7]
+                @test w["back"] == [0.25, -3.0] && w["back"] isa Vector{Float64} && w["big"] == 2^40
+            end
+        end
+    end
+
+    @testset "JavaScript: bridge codec, empty vectors" begin
+        if node === nothing
+            @test_skip "$runtime not found"
+        else
+            B = WasmHost.Bridge
+            types = (Float32, Float64, UInt8, Int8, Int16, UInt16, Int32, UInt32)
+            # each type alone (a frame without a blob region), and all of them mixed with non-empty ones
+            cases = Any[T[] for T in types]
+            push!(cases, Dict{String,Any}("e" => Float32[], "f" => Float64[1.5, -2], "g" => Int8[], "h" => UInt16[7], "i" => UInt32[]))
+            script = """
+            import fs from 'node:fs';
+            import { encodeFrame, decodeFrame } from $(js("common", "bridge.mjs"));
+            const out = [];
+            for (const f of process.argv.slice(1)) {
+              const v = decodeFrame(fs.readFileSync(f));
+              out.push(ArrayBuffer.isView(v) ? `\${v.constructor.name}:\${v.length}` : Object.keys(v).sort().map((k) => `\${k}=\${v[k].constructor.name}:\${Array.from(v[k]).join('|')}`).join(','));
+              fs.writeFileSync(f + '.back', encodeFrame(v));
+            }
+            process.stdout.write(out.join(' '));
+            """
+            mktempdir() do dir
+                files = [joinpath(dir, string(i)) for i in eachindex(cases)]
+                foreach((f, c) -> write(f, B.encode(c)), files, cases)
+                got = split(read(`$node --input-type=module -e $script $files`, String), ' ')
+                @test got[1:8] == ["Float32Array:0", "Float64Array:0", "Uint8Array:0", "Int8Array:0", "Int16Array:0",
+                                   "Uint16Array:0", "Int32Array:0", "Uint32Array:0"]
+                @test got[9] == "e=Float32Array:,f=Float64Array:1.5|-2,g=Int8Array:,h=Uint16Array:7,i=Uint32Array:"
+                for (f, c) in zip(files, cases)
+                    back = B.decode(read(f * ".back"))
+                    @test back == c && typeof(back) == (c isa Vector ? typeof(c) : Dict{String,Any})
+                end
+                @test B.decode(read(files[end] * ".back"))["e"] isa Vector{Float32}
+            end
+        end
+    end
+
+    # js/common/bridge.mjs on its own (test/bridge_unit.mjs): a write that throws (the module's receive is not
+    # stranded, the frames stay queued), the queue's capacity and overflow, bounded chunks, closing from either side,
+    # the answers of asks, the adapters' files
+
+    # js/common/bridge.mjs on its own (test/bridge_unit.mjs), with page.mjs's wait, source and guard: the queue's
+    # capacity and overflow, closing from either side, the answers of asks, onMessage's errors, the record kinds
+    @testset "JavaScript: bridge queue, asks, close" begin
+        if node === nothing
+            @test_skip "$runtime not found"
+        else
+            out = split(chomp(read(`$node $(joinpath(@__DIR__, "bridge_unit.mjs"))`, String)), '\n')
+            @test length(out) >= 50
+            for l in out
+                @test startswith(l, "ok ")
+            end
+        end
+    end
 end

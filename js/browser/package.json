@@ -5,7 +5,7 @@
   "description": "Browser adapter of WasmHost.jl: page messages (page.mjs); downloads and decompression are a design, not written yet (see README.md). Not published.",
   "license": "MIT",
   "type": "module",
-  "exports": { "./page": "./page.mjs" },
+  "exports": { "./page": "./page.mjs", "./bridge": "./bridge.mjs" },
   "wasmhost": {
     "transports": ["import"],
     "waiting": ["jspi"],

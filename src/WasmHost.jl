@@ -13,6 +13,8 @@ nothing changes.
 - [`WasmHost.Page`](@ref): messages (bytes) between the program and the JavaScript around it, over
   the import library `wasm_host_page`; with the package extension `WasmHostPageExt` in the
   compiled module.
+- [`WasmHost.Bridge`](@ref): values (a JSON-like codec with typed arrays) between the module and
+  its page on `Page`, both ways: `send`, `recv`/`serve` (a Julia task waits for the page), `ask`.
 
 The Julia side doesn't know which host it runs on. Requests reach the host by one of two
 transports (see [`transport`](@ref)):
@@ -102,5 +104,6 @@ include("downloads.jl")
 include("decompress.jl")
 include("platform.jl")
 include("page.jl")
+include("bridge.jl")
 
 end # module
