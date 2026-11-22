@@ -12,6 +12,9 @@ import to the linear memory and passes its offset and length (`WasmCodegen.IMPOR
 staging area (`Runtime.Staging`, internal, `host = :wasi`), in chunks of at most `Staging.CHUNK`
 bytes, as `WasmHostDownloadsExt`'s import transport does: WasmCodegen's bytes arguments go one
 way only, so a program for `host = :js` that receives does not compile.
+
+`wait_message` waits on a `julia_io` external handle the host completes (`Runtime.Host.await_handle`:
+with tasks, the task is parked), and `wake` cancels it (`Runtime.JuliaIO.cancel`).
 """
 module WasmHostPageExt
 
@@ -52,6 +55,29 @@ Base.Experimental.@overlay WasmCodegen.Runtime.WASM_METHODS function WasmHost.Pa
     end
     ccall((:pop, "wasm_host_page"), Cvoid, ())
     return buf
+end
+
+## waiting (julia_io: `host_extensions = [:julia_io]`)
+
+Base.Experimental.@overlay WasmCodegen.Runtime.WASM_METHODS function WasmHost.Page.wait_message()
+    h = ccall((:wait, "wasm_host_page"), Int32, ())
+    h == 0 && return nothing
+    h == -1 && throw(ErrorException("Page.wait_message: the host can't wait (makePage was given no julia_io events)"))
+    h < 0 && throw(ErrorException("Page.wait_message: another task waits already (one at a time)"))
+    Page.PARKED[] = h
+    try
+        WasmCodegen.Runtime.Host.await_handle(h)
+    finally
+        Page.PARKED[] = Int32(0)
+        WasmCodegen.Runtime.Host.close(h)
+    end
+    return nothing
+end
+
+Base.Experimental.@overlay WasmCodegen.Runtime.WASM_METHODS function WasmHost.Page.wake()
+    h = Page.PARKED[]
+    h > 0 && WasmCodegen.Runtime.JuliaIO.cancel(h)
+    return nothing
 end
 
 end # module

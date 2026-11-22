@@ -10,6 +10,8 @@
 //   wasm_host_page.pending() -> i32                    the length of the next posted message, or -1
 //   wasm_host_page.read(off i32, start i32, n i32)     copy bytes start .. start+n-1 of it to off
 //   wasm_host_page.pop()                               that message is done
+//   wasm_host_page.wait() -> i32                       0: a message is pending; else a julia_io handle, made ready
+//                                                      when one is (-1: no `events`; -2: one waits already)
 //
 // `onMessage(bytes)` is called once per message the module sends, with a view of the module's
 // memory, valid only until `onMessage` returns: the module's next send writes over it (also one
@@ -20,6 +22,19 @@
 // (by default, console.error) and counted in `stats.errors`, and `Page.send` returns as usual. A
 // JavaScript exception would unwind the module's frames without running its `finally` blocks
 // (WasmCodegen catches only Julia's exceptions), which would leave the staging area allocated.
+//
+// Waiting (`Page.wait_message`, a module with Julia tasks on julia_io): give `events` (WasmCodegen's
+// js/julia_io.mjs `makeJuliaIOEvents()`, the module's julia_io imports). A `wait` with nothing pending
+// returns an external handle, and `post` (or `notify`) makes it ready: the page's message completes a
+// handle of the call in flight, nothing calls into the module.
+//
+// Two hooks for a layer above (WasmHost.Bridge, js/common/bridge.mjs):
+// - `source()`: where the messages come from when nothing posted is queued: the next message (a
+//   Uint8Array, kept as it is), or null. It is called when the module looks at the next message, so
+//   a layer keeps its own queue (and its own limits) and hands it over one message at a time. Call
+//   `notify()` when it has one again (a waiting module is woken).
+// - `guard()`: called first in every import; it may throw (a browser adapter's re-entry check, which
+//   then poisons the instance: js/browser/jspi.mjs `notSuspended`).
 
 export const LIBRARY = 'wasm_host_page';
 
@@ -39,9 +54,11 @@ function ownBytes(message) {
  * `memory` (or `bindMemory` once the instance exists) is the module's exported `memory`.
  * `onError(error, bytes)` gets an exception of `onMessage` (see above).
  */
-export function makePage({ onMessage = () => {}, onError = (err) => console.error('wasm_host_page: onMessage failed:', err), memory = null } = {}) {
+export function makePage({ onMessage = () => {}, onError = (err) => console.error('wasm_host_page: onMessage failed:', err), memory = null,
+                          events = null, source = null, guard = null } = {}) {
   let mem = memory;
   const queue = [];            // posted messages, for the module
+  let parked = 0;              // the handle of the module's wait, or 0
   const stats = { sent: 0, sentBytes: 0, received: 0, receivedBytes: 0, errors: 0 };
   const view = (off, len) => {
     if (!mem) throw new Error('wasm_host_page: no memory (page.bindMemory(instance.exports.memory))');
@@ -52,7 +69,27 @@ export function makePage({ onMessage = () => {}, onError = (err) => console.erro
     stats.sent++; stats.sentBytes += message.length;
     try { onMessage(message); } catch (err) { stats.errors++; onError(err, message); }
   }
-  const pending = () => (queue.length ? queue[0].length : -1);
+  // the next message: the first posted one, or else the source's
+  function front() {
+    if (!queue.length && source) { const m = source(); if (m != null) queue.push(m); }
+    return queue.length ? queue[0] : null;
+  }
+  const pending = () => front()?.length ?? -1;
+  function wait() {
+    if (front() !== null) return 0;
+    if (!events) return -1;
+    if (parked) return -2;
+    const h = events.external({ onClose: () => { if (parked === h) parked = 0; }, onCancel: () => { if (parked === h) parked = 0; } });
+    parked = h;
+    return h;
+  }
+  function notify() {
+    if (!parked || front() === null) return;
+    const h = parked;
+    parked = 0;
+    events.ready(h);
+  }
+  const guarded = (f) => (guard ? (...args) => { guard(); return f(...args); } : f);
   function read(off, start, n) {
     if (!queue.length) throw new Error('wasm_host_page.read: no message is pending');
     const s = start >>> 0, k = n >>> 0;
@@ -65,10 +102,14 @@ export function makePage({ onMessage = () => {}, onError = (err) => console.erro
     stats.received++; stats.receivedBytes += m.length;
   }
   return {
-    imports: { [LIBRARY]: { send, pending, read, pop } },
+    imports: { [LIBRARY]: Object.fromEntries(Object.entries({ send, pending, read, pop, wait }).map(([k, f]) => [k, guarded(f)])) },
     bindMemory(m) { mem = m; },
     /** Queue a message for the module (copied now): `Page.receive`/`Page.poll` get it, in order. */
-    post(message) { queue.push(ownBytes(message)); },
+    post(message) { queue.push(ownBytes(message)); notify(); },
+    /** The source has a message again: a waiting module is woken. */
+    notify,
+    /** Whether the module waits (`Page.wait_message`). */
+    waiting: () => parked !== 0,
     /** How many posted messages the module has not received yet. */
     queued: () => queue.length,
     stats,
