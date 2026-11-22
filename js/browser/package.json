@@ -1,15 +1,16 @@
 {
   "name": "@wasmhost/browser",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "private": true,
-  "description": "Browser adapter of WasmHost.jl: page messages (page.mjs); downloads and decompression are a design, not written yet (see README.md). Not published.",
+  "description": "Browser adapter of WasmHost.jl: downloads (import transport, fetch) and page messages, on @bjorn3/browser_wasi_shim, waiting with JSPI (Chrome 137+). Not published.",
   "license": "MIT",
   "type": "module",
-  "exports": { "./page": "./page.mjs" },
+  "peerDependencies": { "@bjorn3/browser_wasi_shim": "^0.4.2" },
+  "exports": { ".": "./index.mjs", "./page": "./page.mjs" },
   "wasmhost": {
     "transports": ["import"],
     "waiting": ["jspi"],
-    "capabilities": { "downloads": "planned", "decompress": "planned: gzip, deflate (DecompressionStream); no zstd", "platform": "none", "page": "wasm_host_page (page.mjs): tested in Node and Bun, not in a browser" },
-    "tested": false
+    "capabilities": { "downloads": "import", "decompress": "none (spool transport only: later)", "platform": "none", "page": "wasm_host_page (page.mjs): tested in Node and Bun" },
+    "tested": true
   }
 }
