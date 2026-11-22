@@ -17,7 +17,8 @@ f() = String(take!(Downloads.download("https://example.org/data.csv", IOBuffer()
 ```
 
 **Status:** an early release. Tested on **Node** and **Bun** (CI), with both transports, spool
-and import. Other hosts are designed but untested; see [Hosts](#hosts).
+and import, and in headless **Chromium** with the import transport. Other hosts are designed
+but untested; see [Hosts](#hosts).
 
 WasmHost.jl was called WasmFetch.jl until it gained decompression and platform tags. Same UUID.
 
@@ -271,7 +272,7 @@ protocols in `js/common/`. See [`js/README.md`](js/README.md).
 | Host | Future package | Downloads | Decompression | Platform tags | Waiting | Tested? |
 |---|---|---|---|---|---|---|
 | **Node** 24+ (`node:wasi`) | `@wasmhost/node` (`js/node/`) | spool (`spool.mjs`), import (`imports.mjs`) | spool: gzip, deflate, zstd | detected arch, os, libc + overrides | JSPI; sync worker (spool) | **Yes** (CI, with Bun 1.4): spool in both modes; import |
-| **Browsers** | `@wasmhost/browser` (`js/browser/`, not written) | import intended; spool only on a JavaScript WASI filesystem | `DecompressionStream`: gzip, deflate, no zstd | none to detect | JSPI where available; a sync worker only with cross-origin isolation | **No.** Design notes only: not supported until something has run in a browser |
+| **Browsers** with JSPI (Chrome/Edge 137+) | `@wasmhost/browser` (`js/browser/`), on `@bjorn3/browser_wasi_shim` | import (`imports.mjs`); spool: later | none yet (spool only) | none to detect | JSPI; one call at a time (`promisingExports`), a re-entrant call poisons the instance | **Yes** (CI): import in headless Chromium, against native. See [`js/browser/README.md`](js/browser/README.md) |
 | **workerd** | – | import fits; no filesystem | `DecompressionStream` | – | JSPI, if available | **No** (`js/workerd/`) |
 | **wasmtime** | – | CLI: no (needs a helper process and polling); import from an embedding | the embedding's | the embedding's | the embedding's | **No** (`js/wasmtime/`) |
 
@@ -304,6 +305,10 @@ Expect to update this package when either changes.
     and UTF-8 strings (up to 1.2 MB), and sends back what the host posts (`prun.mjs`). Its
     output and the messages the host receives must equal the native run's (`pnative.jl`). It
     runs for WASI, then for JavaScript (sending only).
+  - `WASM_RUNTIME=chromium` (`import` only): the browser adapter in Playwright's headless
+    Chromium (`test/e2e/browser/`; `npm ci` and `npx playwright install chromium` there
+    first), the server on another origin (CORS), the echoed User-Agent the browser's. Then one
+    check of the calls: queued, and a re-entrant call poisons the instance.
 
   ```
   julia test/e2e/e2e.jl /path/to/WasmCodegen.jl [spool|import|decompress|page|all]

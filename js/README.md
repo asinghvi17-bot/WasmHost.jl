@@ -18,7 +18,7 @@ code in `common/`.
 |---|---|---|---|---|---|---|---|
 | `common/` | (bundled into each) | any | protocol `wasm-fetch 1`, libcurl's error codes | protocol `wasm-decompress 1`, magic bytes | merging, checking, `WASMHOST_PLATFORM` | – | through Node |
 | `node/` | `@wasmhost/node` | Node 24+ and Bun 1.4+ (`node:wasi`) | spool: `spool.mjs`; import: `imports.mjs` | spool: gzip, deflate, zstd (`node:zlib`) | `platform.mjs` (arch, os, libc) | JSPI; sync worker + `Atomics.wait` (spool) | **yes**, end to end against native |
-| `browser/` | `@wasmhost/browser` | browsers | import planned; spool only on a JavaScript WASI filesystem | `DecompressionStream`: gzip, deflate, no zstd (planned) | none to detect | JSPI where available; a sync worker only with cross-origin isolation | **no**: design notes, not written |
+| `browser/` | `@wasmhost/browser` | browsers with JSPI (Chrome/Edge 137+), on `@bjorn3/browser_wasi_shim` | import: `imports.mjs`; spool: later | none yet | none to detect | JSPI; one call at a time (`promisingExports`) | **yes**, import, end to end against native in headless Chromium |
 | `workerd/` | – | Cloudflare workerd | import | `DecompressionStream` | – | JSPI if available | **no**: notes |
 | `wasmtime/` | – | wasmtime | import, from an embedding | the embedding's | the embedding's | the embedding's | **no**: notes |
 
