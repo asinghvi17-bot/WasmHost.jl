@@ -1,5 +1,5 @@
-# End-to-end checks: compile a program with WasmCodegen, run it in Node with WasmHost's adapter,
-# and compare it with native.
+# End-to-end checks: compile a program with WasmCodegen, run it in Node, Bun or a headless Chromium with WasmHost's
+# adapter, and compare it with native.
 #
 #   julia test/e2e/e2e.jl /path/to/WasmCodegen.jl [spool|import|decompress|page|all]
 #
@@ -13,8 +13,12 @@
 # - page: test/e2e/pprog.jl (WasmHost.Page) for WASI, both directions, with the page adapter
 #   (js/common/page.mjs, prun.mjs): its output and the messages it sends must equal the native
 #   run's (pnative.jl). Then for JavaScript (`host = :js`, sending only).
+# - WASM_RUNTIME=chromium: import only, with the browser adapter (js/browser/) in Playwright's headless Chromium,
+#   driven by Node (test/e2e/browser/: `npm ci` and `npx playwright install chromium` there first). The test server
+#   is on another origin than the page (CORS), and the browser sends its own User-Agent, which the native T3 body
+#   line gets instead of Downloads'. Then browser/page.mjs's checkCalls: calls queued, a re-entrant call poisons.
 #
-# Environment: JULIA (default: this julia), WASM_RUNTIME (node, the default, or bun), NODE (default: `node` on PATH,
+# Environment: JULIA (default: this julia), WASM_RUNTIME (node, the default, bun or chromium), NODE (default: `node` on PATH,
 # Node 24+, which has JSPI) or BUN (default: `bun` on PATH), WASMBUILDER / IRSTRUCTURIZER (paths, optional: otherwise WasmCodegen's own
 # [sources]), E2E_REUSE=1 (run modules an earlier run built, without rebuilding them),
 # E2E_ARTIFACTS (a directory with ARTIFACT.tar.gz and ARTIFACT.tar.zst, instead of downloading
@@ -29,11 +33,14 @@ const ROOT = dirname(dirname(HERE))
 wcg = abspath(ARGS[1])
 which = get(ARGS, 2, "spool")
 julia = get(ENV, "JULIA", joinpath(Sys.BINDIR, Base.julia_exename()))
-# the JavaScript runtime: WASM_RUNTIME=node (the default; NODE) or bun (BUN)
+# the JavaScript runtime: WASM_RUNTIME=node (the default; NODE), bun (BUN) or chromium (driven by NODE)
 runtime = get(ENV, "WASM_RUNTIME", "node")
-runtime in ("node", "bun") || error("WASM_RUNTIME must be node or bun, not $(repr(runtime))")
-node = something(get(ENV, uppercase(runtime), nothing), Sys.which(runtime), Some(nothing))
-node === nothing && error("$runtime is not on PATH: install it (Node 24+ or Bun) or set $(uppercase(runtime)) to its path")
+runtime in ("node", "bun", "chromium") || error("WASM_RUNTIME must be node, bun or chromium, not $(repr(runtime))")
+const BROWSER = runtime == "chromium"
+BROWSER && which != "import" && error("e2e $which: not in chromium (the browser adapter has the import transport only)")
+driver = BROWSER ? "node" : runtime
+node = something(get(ENV, uppercase(driver), nothing), Sys.which(driver), Some(nothing))
+node === nothing && error("$driver is not on PATH: install it (Node 24+ or Bun) or set $(uppercase(driver)) to its path")
 work = mkpath(joinpath(HERE, "work"))
 
 # a real artifact (Bzip2_jll's binaries for aarch64-linux-gnu; any artifact works): its tree hash
@@ -95,6 +102,7 @@ function downloads(env, transport)
     ok = !isempty(lines(native, "T"))
     wasm = joinpath(work, "fetch-$transport.wasm")
     build(env, wasm, transport, "fetch")
+    BROWSER && return ok & browser(wasm, native)
     for mode in (transport == "import" ? ["import"] : ["jspi", "sync"])
         out = output(`$node $NODE_FLAGS $(joinpath(HERE, "run.mjs")) $wasm $mode $(joinpath(work, mode))`)
         skipped(out, "$transport/$mode") && continue
@@ -104,6 +112,21 @@ function downloads(env, transport)
         ok &= same
     end
     return ok
+end
+
+# (chromium) the module as native, but with the browser's User-Agent in the T3 body (server.mjs echoes it); then checkCalls
+function browser(wasm, native)
+    out = output(`$node $(joinpath(HERE, "browser", "run.mjs")) $wasm`)
+    skipped(out, "import/chromium") && return true
+    m = match(r"^user agent: (.*)$"m, out)
+    want = [startswith(l, "T3 body ") && m !== nothing ? replace(l, r"ua=.*$" => "ua=" * m[1]) : l for l in lines(native, "T")]
+    same = m !== nothing && lines(out, "T") == want && occursin("identical to the server's: true", out) &&
+           occursin("spool files left: 0", out)
+    println("== import/chromium: ", same ? "IDENTICAL to native (the echoed User-Agent: the browser's)" : "DIFFERENT", "\n", out)
+    calls = output(`$node $(joinpath(HERE, "browser", "run.mjs")) $wasm calls`)
+    good = occursin("CALLS PASS", calls)
+    println("== import/chromium, calls: ", good ? "queued; the re-entrant call POISONED the instance" : "WRONG", "\n", calls)
+    return same & good
 end
 
 # the compressed artifact, both encodings of the Pkg server

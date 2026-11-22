@@ -1,0 +1,11 @@
+{
+  "name": "wasmhost-e2e-browser",
+  "private": true,
+  "description": "The browser end-to-end test of WasmHost.jl (test/e2e/e2e.jl with WASM_RUNTIME=chromium): Playwright's headless Chromium and the WASI shim the page runs the module on.",
+  "license": "MIT",
+  "type": "module",
+  "devDependencies": {
+    "@bjorn3/browser_wasi_shim": "0.4.2",
+    "playwright": "1.65.0"
+  }
+}
